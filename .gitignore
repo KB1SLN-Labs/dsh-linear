@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+*.bak
+coverage/
+
+# local test outputs
+*.test-output.txt
+test-results/
+tmp/

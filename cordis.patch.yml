@@ -1,0 +1,19 @@
+# @kb1slnlabs/dsh-linear — profile patch layer
+#
+# Adds the Linear issue-tracking tool suite to a profile. The plugin registers
+# its tools through ctx.tools.register at apply time; no further composition
+# is needed.
+#
+# Config:
+#   apiKey: Linear personal API key (li_api_...). Optional — falls back to the
+#           LINEAR_API_KEY environment variable.
+#
+# Example row (in a profile's cordis.patch.yml):
+#   - id: linear
+#     name: '@kb1slnlabs/dsh-linear'
+#     config:
+#       apiKey: li_api_...
+
+- insert:
+    - id: linear
+      name: '@kb1slnlabs/dsh-linear'
