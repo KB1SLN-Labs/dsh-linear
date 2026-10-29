@@ -13,8 +13,8 @@ It exposes **two tool surfaces**:
    transport. These tool definitions are not written here: they are **discovered at
    runtime** with `tools/list`, so their number and shape are whatever Linear serves.
 
-> Status: this package is **not published to npm**. Everything below installs from
-> a local directory. The offline suites below are mock-tested, **except** `test-loader.mjs`
+> Status: current release **0.1.0**, published as the public GitHub repository
+> `KB1SLN-Labs/dsh-linear` and on npm as `@kb1slnlabs/dsh-linear`. The offline suites below are mock-tested, **except** `test-loader.mjs`
 > and `test-image-runtime.mjs`, which run against the real host services — the plugin
 > loader plus the real `ToolRuntime`/`SystemPrompt` — rather than stubs; the live checks
 > this repo has run are the introspection guard in `test.js` and a real discovery of the
@@ -153,20 +153,38 @@ inline bytes, so a `linear_mcp_*` result is projected before the model sees it:
 
 ## Install
 
-**This package is not on the npm registry — there is no published version to add by
-name.** Until it is published, install it into a profile from this checkout:
+Release **0.1.0** is published on the public GitHub repository
+`KB1SLN-Labs/dsh-linear` and on npm as `@kb1slnlabs/dsh-linear`. Four install routes:
 
 ```powershell
-# 1. install this plugin's own dependencies
+# 0. install this plugin's own dependencies (local checkout route only)
 npm install
 
-# 2. add it to a profile as a local link (prepublication example)
+# 1. local link with an absolute path (working checkout, edits picked up in place)
 dsh plugin --profile web add link:<absolute-path-to-this-directory>
+
+# 2. from the public GitHub repository (default branch — unpinned)
+dsh plugin --profile web add github:KB1SLN-Labs/dsh-linear
+
+# 3. from npm, by package name (latest published version)
+dsh plugin --profile web add @kb1slnlabs/dsh-linear
+
+# 4. version-pinned release asset — download the tarball attached to the v0.1.0
+#    GitHub release, then install it from disk:
+#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.1.0/kb1slnlabs-dsh-linear.tgz
+dsh plugin --profile web add file:./kb1slnlabs-dsh-linear.tgz
 ```
 
-`link:` points pnpm at the directory rather than copying it, so the profile picks up
-edits in place. Use an **absolute** path — that is what this repo's own install used,
-and it is what makes the spec unambiguous regardless of where `dsh plugin` runs from.
+Route 1 (`link:`) points pnpm at the directory rather than copying it, so the profile
+picks up edits in place. Use an **absolute** path — that is what this repo's own install
+used, and it is what makes the spec unambiguous regardless of where `dsh plugin` runs
+from. Routes 2–4 install a copy instead, so later source edits do not leak into the
+profile. Only route 4 pins an exact version: `kb1slnlabs-dsh-linear.tgz` is the release
+asset attached to the v0.1.0 GitHub release — a fixed name renamed from the output of
+`npm pack`, not the filename npm itself generates. Route 2 follows the repository's
+default branch and route 3 follows npm's `latest`, so neither is guaranteed to install
+0.1.0 once newer work or releases exist; use route 4 when reproducibility matters.
+
 The clean scratch profile behind the verification described under
 [Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
 Adding the package also adds `@kb1slnlabs/dsh-linear` to the

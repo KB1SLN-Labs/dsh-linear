@@ -5,6 +5,14 @@
   "type": "module",
   "main": "index.js",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KB1SLN-Labs/dsh-linear.git"
+  },
+  "homepage": "https://github.com/KB1SLN-Labs/dsh-linear#readme",
+  "bugs": {
+    "url": "https://github.com/KB1SLN-Labs/dsh-linear/issues"
+  },
   "files": [
     "index.js",
     "cordis.patch.yml",
