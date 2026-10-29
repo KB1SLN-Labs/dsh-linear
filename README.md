@@ -14,8 +14,11 @@ It exposes **two tool surfaces**:
    runtime** with `tools/list`, so their number and shape are whatever Linear serves.
 
 > Status: this package is **not published to npm**. Everything below installs from
-> a local directory. Nothing in it has been verified against the live Linear GraphQL
-> API or the live hosted MCP endpoint — see [Testing](#testing).
+> a local directory. The offline suites below are mock-tested, **except** `test-loader.mjs`
+> and `test-image-runtime.mjs`, which run against the real host services — the plugin
+> loader plus the real `ToolRuntime`/`SystemPrompt` — rather than stubs; the live checks
+> this repo has run are the introspection guard in `test.js` and a real discovery of the
+> hosted MCP tool set — see [Testing](#testing) for exactly what is and is not proven.
 
 ## Tools
 
@@ -125,23 +128,54 @@ Override env vars used to pin dependency resolution (mainly for offline tests):
 `DSH_LINEAR_TOOLS`, `DSH_LINEAR_SCHEMA`, `DSH_LINEAR_MCP_SDK`,
 `DSH_LINEAR_MCP_SDK_TRANSPORT`, `DSH_LINEAR_MCP_SDK_TYPES`, `DSH_LINEAR_MCP_SDK_ZOD`.
 
+### What MCP result content becomes model-visible
+
+The harness model vocabulary carries images as **durable attachment references**, not
+inline bytes, so a `linear_mcp_*` result is projected before the model sees it:
+
+- An `image` block is admitted **only when the current model route declares image
+  input** — positive proof via the host's `llm.resolveModelInfo` for the exact
+  provider/model that will read this result, plus a mounted `attachments` service. The
+  bytes then go through the host's own admission pipeline (`attachments.saveImages`),
+  which owns the count / aggregate-byte / media-type limits.
+- Anything else — a model that does not declare image input, no mounted store, an
+  unresolvable route, an invalid block (non-canonical base64, or a media type outside
+  PNG/JPEG/WebP/GIF), or an admission rejection (`TOO_MANY_IMAGES`, `IMAGE_TOO_LARGE`,
+  …) — yields a text diagnostic in place of that image:
+  `[image unavailable: <media type>; <reason>; raw image data remains available to
+  programmatic callers]`. One invalid block falls back every image in the same result.
+- **The canonical raw result is never rewritten.** Base64 stays in `result.value` for
+  programmatic callers either way; only the model-visible content carries references or
+  diagnostics. Text and error behaviour are unchanged.
+- `audio`, embedded `resource`, and `resource_link` blocks stay **text placeholders** —
+  they are not admitted as attachments (`resource_link` becomes
+  `Resource link: <name> (<uri>)`).
+
 ## Install
 
 **This package is not on the npm registry — there is no published version to add by
-name.** Install it locally, from this directory:
+name.** Until it is published, install it into a profile from this checkout:
 
 ```powershell
 # 1. install this plugin's own dependencies
 npm install
 
-# 2a. point a profile patch row at the local directory, e.g.
-#     - insert:
-#         - id: linear
-#           name: 'D:/kb1slnlabs-projects/dsh-plugins/linear'
-
-# 2b. or link it into the profile's / dsh install's node_modules
-npm link    # then link node_modules/@kb1slnlabs/dsh-linear -> this directory
+# 2. add it to a profile as a local link (prepublication example)
+dsh plugin --profile web add link:<absolute-path-to-this-directory>
 ```
+
+`link:` points pnpm at the directory rather than copying it, so the profile picks up
+edits in place. Use an **absolute** path — that is what this repo's own install used,
+and it is what makes the spec unambiguous regardless of where `dsh plugin` runs from.
+The clean scratch profile behind the verification described under
+[Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
+Adding the package also adds `@kb1slnlabs/dsh-linear` to the
+profile's `dsh.profile.bundles` layer list, because its manifest declares
+`dsh.bundle.patch`.
+
+To add it as a plain dependency instead of a link, use `file:<absolute-path>` or a
+packaged tarball (`npm pack`, then `dsh plugin --profile web add file:<path-to-tgz>`) —
+that is how the scratch profile used by [Testing](#testing) was built.
 
 Peer dependencies `@deepseek-ai/dsh-tools` and `@deepseek-ai/cordis`, plus
 `@modelcontextprotocol/sdk` and `zod`, normally resolve from the **dsh install's own**
@@ -151,38 +185,128 @@ then `%APPDATA%/npm/node_modules` on Windows or `/usr/local/lib/node_modules` /
 `/usr/lib/node_modules` on POSIX. The MCP SDK and its zod must come from one and the
 same tree — a partial tree pins nothing.
 
+The `@deepseek-ai/dsh-tools` this package pins (`0.1.5-rc.2`) was verified against host
+**0.2.1-rc.3**. In a base-only scratch profile it can log **missing-peer warnings** —
+that is expected: the host supplies those services, and the pinned copy exists so the
+plugin resolves its own peer at all. Do not read such a warning as a failure.
+
 ## Testing
 
-Two suites, both **offline** (loopback mock servers only; no Linear API call, no real
-credential):
+Four suites: the mock halves are **offline** (loopback mock servers only; no real
+credential), but `test.js` additionally runs a live schema check against
+`api.linear.app` whenever `LINEAR_API_KEY` is set — see below, and note that
+`test-loader.mjs` and `test-image-runtime.mjs` are not mocks at all.
 
 ```
-node test.js             # GraphQL half: module surface, 20 tool registrations,
-                         # 40 GraphQL calls against a mock that mirrors the real
-                         # Linear schema (flat UUID inputs, plural-field resolution,
-                         # auth header), plus negative cases
-node test-mcp-bridge.js  # MCP half: naming contract, paginated discovery, Bearer
-                         # auth with no token leak, raw-name forwarding, isError
-                         # handling, list_changed re-sync, disposal, fail-soft paths
+node test.js                # GraphQL half: module surface, 20 tool registrations,
+                            # 40 GraphQL calls against a mock that mirrors the real
+                            # Linear schema (flat UUID inputs, plural-field resolution,
+                            # auth header), plus negative cases; and, when
+                            # LINEAR_API_KEY is set, the live introspection guard
+node test-mcp-bridge.js     # MCP half: naming contract, paginated discovery, Bearer
+                            # auth with no token leak, raw-name forwarding, isError
+                            # handling, list_changed re-sync, disposal, fail-soft paths,
+                            # and image-result projection/admission through the bridge
+node test-loader.mjs        # loader half — needs two environment variables, see below
+node test-image-runtime.mjs # image half: real ToolRuntime + SystemPrompt, a stubbed
+                            # llm route that declares image input and a stubbed
+                            # attachment store; asserts an MCP image result comes back
+                            # as a model-visible image block while the raw base64 stays
+                            # in result.value. No network, no profile, no env vars.
 ```
+
+### `test-loader.mjs` — what it runs and what it needs
+
+Unlike the mock suites, `test-loader.mjs` exercises the **real plugin loader and the real
+host tool runtime**: it boots a Cordis `Context`, attaches the host's real
+`SystemPrompt` and `ToolRuntime` services (imported from the dsh installation, not
+stubbed), runs `cordis-plugin-loader`, installs this plugin into that context through
+the profile, asserts the entry got a live fiber and that exactly the 20 `linear_*`
+names are known to the runtime — then disposes the fiber and asserts all 20 are gone.
+It carries a 15-second step deadline: before each phase it checks whether 15 seconds
+have elapsed and, if so, fails with `15 second bound exceeded at: <label>`. That
+deadline is a progress budget between steps, **not** a hard timeout — it cannot
+interrupt an asynchronous call that never settles, so a hung import or await stalls the
+run instead of being cut off at 15 seconds.
+
+Both variables are **required**; a missing or malformed one fails immediately with an
+actionable message rather than an import error:
+
+| Variable | Meaning | Accepted form |
+|---|---|---|
+| `DSH_ROOT` | the dsh installation directory — the one holding `node_modules/@deepseek-ai/cordis`, from which `cordis`, `cordis-plugin-loader`, `dsh-system-prompt` and `dsh-tools` are resolved | absolute filesystem path (a trailing slash is added for you) |
+| `LINEAR_TEST_PROFILE` | the profile directory to load the plugin against — it must already have this package installed as a dependency/bundle layer | absolute filesystem path **or** a `file:` URL; converted with `pathToFileURL` plus a trailing slash so it is a directory URL, and checked for existence |
+
+A non-`file:` URL (`http:`, `npm:`, …) is rejected. Relative paths are not accepted —
+there is no sensible anchor for them here.
+
+```powershell
+$env:DSH_ROOT = "C:/Users/<you>/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh"
+$env:LINEAR_TEST_PROFILE = "<dsh-home>/profiles/<profile>"   # or file:///<same path>
+node test-loader.mjs
+```
+
+The suite deletes `LINEAR_API_KEY`, `LINEAR_MCP_TOKEN`, `LINEAR_APIKEY` and
+`LINEAR_KEY` from its own environment before loading, so the plugin it installs cannot
+pick up a live credential and the bridge stays off. That clearing is scoped to this
+process — other suites behave differently: `test.js` deliberately runs live against
+`api.linear.app` when a real key is present (see below).
+
+**What this does not cover:** it is not a full headless boot. No LLM, session log,
+filesystem sandbox, or app entry tree is started — only the loader plus those two host
+services inside a bare `Context`. And it never contacts Linear: no GraphQL call and no
+connection to the hosted MCP server are made, so the discovered `linear_mcp_*` surface
+is not exercised here. The scratch profile it runs against is a throwaway directory,
+not your day-to-day profile.
 
 `test.js` additionally carries a **live introspection guard** that runs only when
 `LINEAR_API_KEY` is set: it introspects the real Linear schema and asserts every input
 field and query field the plugin emits actually exists. Without a key it prints
-`skip - introspection guard`. In an environment with no `LINEAR_API_KEY`, both suites
-pass and that guard is skipped.
+`skip - introspection guard`. So in an environment with no `LINEAR_API_KEY` the suite
+passes with that guard skipped, but **with a key set, `test.js` does use live network** —
+it sends a real introspection request to `https://api.linear.app/graphql`, and a schema
+mismatch makes the run throw rather than skip.
+
+### `test-image-runtime.mjs` — what it runs and what it needs
+
+No environment variables and no profile: it builds a bare Cordis `Context`, attaches the
+real `SystemPrompt` and `ToolRuntime` (mode `native`), registers one hand-built MCP
+definition, executes it through `tools.execute`, and asserts the finalized content is
+`[text, image-with-attachment-ref]` while `result.value` still carries the raw base64.
+The `llm` route (`inputModalities: ['image']`) and the attachment store are stubs — so
+this proves the bridge's admission **decision** and projection against the real runtime,
+not a real model's image support or the host's real byte/count limits. It needs the same
+peer resolution as the plugin itself (a dsh installation to import `cordis`,
+`dsh-tools`, and `dsh-system-prompt` from), and it can emit the missing-peer warnings
+described under [Install](#install).
 
 ### What is verified vs. what is not
 
-- **Verified (mock-tested):** everything the two suites above assert — registration,
-  GraphQL query/mutation shape, the auth header forms, identifier resolution, error
-  payloads, MCP discovery/naming/forwarding/reconnect/disposal lifecycle.
-- **Not verified against live services:** no run in this repo's check has exercised a
-  real `linear_*` call end-to-end against `api.linear.app`, and no run has connected
-  to the real `https://mcp.linear.app/mcp` endpoint. The MCP tool set, its schemas,
-  and its auth behaviour are therefore **unconfirmed against Linear's hosted server** —
-  the bridge is only proven correct against a local mock that speaks MCP. Treat live
-  use as untested until you run it with your own key and report what happens.
+- **Verified (mock-tested):** what `test.js` and `test-mcp-bridge.js` assert —
+  registration, GraphQL query/mutation shape, the auth header forms, identifier
+  resolution, error payloads, MCP discovery/naming/forwarding/reconnect/disposal
+  lifecycle, and image admission refusals against stubbed host services.
+- **Verified against real host services (not mocks):** `test-loader.mjs` loads this
+  package through the real plugin loader into a real `ToolRuntime`, and
+  `test-image-runtime.mjs` finalizes an MCP image result through the real
+  `ToolRuntime`/`SystemPrompt`. The scratch profile behind that run was installed via
+  the **DSH plugin manager** and verified on **desktop runtime 0.2.1-rc.3** with the
+  Cordis loader plus `ToolRuntime` — a bare host context, **not** a full desktop app
+  boot: no LLM turn, session log, sandbox, or app entry tree was started.
+- **Verified against live services:** the hosted MCP bridge has been checked against
+  the real `https://mcp.linear.app/mcp` endpoint — a real run through the DSH
+  `ToolRuntime`, installing this package from a clean scratch package, discovered
+  **68** `linear_mcp_*` tools. The live Linear GraphQL introspection guard in `test.js`
+  has likewise run with a real key and passed. So the MCP tool count, names, and schemas
+  are what Linear actually served at that time, not guesses.
+- **Not verified:** no run in this repo's check has exercised a real `linear_*` **write**
+  end-to-end against `api.linear.app` — the GraphQL half is proven against a mock that
+  mirrors the introspected schema (plus the live schema-shape guard above), not against
+  real issue mutations. Image admission likewise has **not** been exercised with a real
+  model route or a real attachment store — only with declared-modalities and stored-ref
+  stand-ins. Nothing here was run on more than that one Windows host/runtime, so treat
+  other platforms as untested. Linear's hosted MCP tool set can also change server-side,
+  so re-discover it with your own key before relying on the exact count or shapes above.
 
 ## Notes
 

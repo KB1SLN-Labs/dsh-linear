@@ -17,6 +17,14 @@
 //      disposed and the new one registered
 //   7. disposal: the ctx.effect disposer closes the client, unregisters the
 //      tools, and stops reconnect timers
+//   8. image-result projection through the FULL pipeline — createMcpDefinition
+//      → execute → output.render → finalizeContent (projectMcpResultContent):
+//      valid mixed text/image keeps its order and becomes attachment
+//      references, malformed base64/MIME is refused before anything reaches
+//      the store, a model without image input / no mounted attachment service /
+//      an admission denial all fall back to the `image unavailable` diagnostic,
+//      structuredContent rides the canonical value, and every guard in the
+//      finalizer is exercised (rewritten outcome, error result, foreign exec)
 //
 // Run: node test-mcp-bridge.js   (no LINEAR_API_KEY / LINEAR_MCP_TOKEN needed)
 // Exits on its own once the checks pass — every mock server is fully closed
@@ -79,7 +87,9 @@ assert.equal(mod.supportedOutputSchema({ type: 'object', properties: { a: { type
 assert.equal(mod.extractText([{ type: 'text', text: 'hi' }, { type: 'text', text: 'there' }], 't'), 'hi\nthere')
 assert.equal(mod.extractText([], 'search_issues'), '(search_issues returned no model-visible content)')
 assert.equal(mod.extractText(undefined, 't'), '(t returned no model-visible content)')
-assert.match(mod.extractText([{ type: 'image', data: 'AAA', mimeType: 'image/png' }], 't'), /image result unsupported/)
+// An image block with no admission path falls back to the `image unavailable`
+// diagnostic — never the obsolete "image result unsupported" wording.
+assert.match(mod.extractText([{ type: 'image', data: 'AAA', mimeType: 'image/png' }], 't'), /image unavailable: image\/png/)
 assert.match(mod.extractText([{ type: 'audio', mimeType: 'audio/wav' }], 't'), /audio result unsupported: audio\/wav/)
 assert.equal(mod.extractText([{ type: 'resource_link', name: 'Doc', uri: 'https://x/y' }], 't'), 'Resource link: Doc (https://x/y)')
 assert.match(mod.extractText([{ type: 'resource_link', uri: 'https://x/y' }], 't'), /missing its name or URI/)
@@ -466,6 +476,377 @@ const tool = (name, extra = {}) => ({ name, description: `desc ${name}`, inputSc
   assert.equal(connectsAfter, connectsBefore, 'dispose cancels the pending reconnect timer — no further connect attempts')
   await mock.close()
   console.log('ok - disposal stops reconnect scheduling')
+}
+
+// ---------------------------------------------------------------------------
+// 11. Image-result projection through the real pipeline
+//     (createMcpDefinition → execute → output.render → finalizeContent)
+//
+// Same loopback mock server as above; the only additions are image-bearing
+// tools/call results and a harness ctx that mounts the two services the
+// admission pipeline reads — ctx.get('attachments') (the durable store, whose
+// count/byte/media-type limits it defers to) and ctx.get('llm') (route capability
+// proof). Every check runs the DEFINITION the bridge registered, never a copy of
+// its internals: execute prepares + records the projection, output.render is what
+// the registry snapshots as the model-visible fallback, and finalizeContent is
+// the last-mile transform.
+// ---------------------------------------------------------------------------
+
+// A real 1×1 PNG (plus its base64) so decoded bytes are verifiable, not 'AAA'.
+const PNG_1PX = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+)
+const PNG_B64 = PNG_1PX.toString('base64')
+const WEBP_B64 = Buffer.from('UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA/vuUAAA=', 'base64').toString('base64')
+
+const imageBlock = (data = PNG_B64, mimeType = 'image/png') => ({ type: 'image', data, mimeType })
+const textBlock = (text) => ({ type: 'text', text })
+
+/** Deep clone — the mock server JSON round-trips results, so a test that hands
+ *  the same literal object to execute() has two different copies in play. */
+const clone = (value) => JSON.parse(JSON.stringify(value))
+
+/** Harness ctx with the services resolveImageAdmission reads, all observable. */
+function makeImageCtx({ attachments, inputModalities = ['text', 'image'], llmThrows = false, noLlm = false, provider = 'fake-provider', model = 'fake-model' } = {}) {
+  const ctx = makeCtx()
+  const llmCalls = []
+  const services = new Map()
+  if (attachments !== undefined) services.set('attachments', attachments)
+  if (!noLlm) {
+    services.set('llm', {
+      async resolveModelInfo(p, m, signal) {
+        llmCalls.push({ provider: p, model: m, signal })
+        if (llmThrows) throw new Error('model catalogue unreachable')
+        return { inputModalities }
+      },
+    })
+  }
+  return Object.assign(ctx, {
+    get: (key) => services.get(key),
+    llmCalls,
+    exec: () => ({ signal: new AbortController().signal, agent: { options: { provider, model } } }),
+  })
+}
+
+/** Durable store double: records every saveImages batch, returns stable refs. */
+function makeStore(impl) {
+  const saved = []
+  return {
+    saved,
+    async saveImages(decoded) {
+      saved.push(decoded.map((d) => ({ mediaType: d.mediaType, length: d.data.length, bytes: d.data })))
+      return impl(decoded)
+    },
+  }
+}
+
+/** Boot the bridge against a mock whose tools/call replies with `result`. */
+async function bridgeWithResult(toolName, result) {
+  // Fresh copy per call: the server JSON round-trips it, so the blocks execute()
+  // sees are never the objects the test literal holds.
+  const mock = await startMockMcpServer({ pages: [{ tools: [tool(toolName)] }], callHandler: () => clone(result) })
+  const ctx = makeImageCtx()
+  await mod.apply(ctx, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+  const def = ctx.registered.get(`linear_mcp_${toolName}`)
+  assert.ok(def, `tool ${toolName} discovered`)
+  return { mock, ctx, def }
+}
+
+// 11a. Valid mixed text/image → ordered attachment references; the canonical
+// value keeps every raw byte; structuredContent rides alongside content.
+{
+  const store = makeStore((decoded) => decoded.map((_, i) => ({ id: `att${i}` })))
+  const mock = await startMockMcpServer({
+    pages: [{ tools: [tool('image_tool', { outputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'], additionalProperties: false } })] }],
+    // Fresh blocks per call — a real server round-trips the result through JSON,
+    // so the array execute() holds is never one the test can also hold.
+    callHandler: () => ({
+      content: [textBlock('before'), imageBlock(), textBlock('mid1'), textBlock('mid2'), imageBlock(WEBP_B64, 'image/webp'), textBlock('after')],
+      structuredContent: { id: 'i1' },
+    }),
+  })
+  const ctx = makeImageCtx({ attachments: store })
+  await mod.apply(ctx, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+  const def = ctx.registered.get('linear_mcp_image_tool')
+
+  const exec = ctx.exec()
+  const value = await def.execute({}, exec)
+
+  // Canonical value: raw blocks untouched (byte-for-byte), structuredContent kept.
+  assert.equal(value.content.length, 6, 'canonical content still carries every block in order')
+  assert.deepEqual(value.content[1], { type: 'image', data: PNG_B64, mimeType: 'image/png' }, 'raw base64 survives in the canonical value')
+  assert.deepEqual(value.structuredContent, { id: 'i1' }, 'structuredContent passes through untouched')
+
+  // The store saw exactly one ordered batch of correctly decoded bytes.
+  assert.equal(store.saved.length, 1, 'one saveImages call per result')
+  assert.deepEqual(
+    store.saved[0].map(({ mediaType, length }) => ({ mediaType, length })),
+    [{ mediaType: 'image/png', length: PNG_1PX.length }, { mediaType: 'image/webp', length: Buffer.from(WEBP_B64, 'base64').length }],
+    'the decoded batch is ordered and matches the declared media types',
+  )
+  assert.ok(Buffer.compare(store.saved[0][0].bytes, PNG_1PX) === 0, 'decoded bytes are the canonical decode')
+
+  // Model-visible fallback (what the registry renders) is the pre-existing text projection.
+  const fallback = def.output.render({}, value)
+  assert.deepEqual(fallback, [{ type: 'text', text: mod.extractText(value.content, 'image_tool') }], 'render stays a single coalesced text block')
+
+  // finalizeContent: images become attachment references at their original
+  // positions, and the surrounding text runs keep their newline coalescing.
+  // This IS the registry's own application — dsh-tools hands the snapshotted
+  // finalizer exactly this shape (isError + content + value; structuredContent
+  // lives in `value` and nowhere in the rendered content, which is why the
+  // recorded canonical value must carry it). The projection is consumed by its
+  // first read, so the outcome handed here is the one place it can land.
+  const finalized = def.finalizeContent(exec, { isError: false, content: fallback, value })
+  assert.deepEqual(finalized, [
+    { type: 'text', text: 'before' },
+    { type: 'image', attachment: { id: 'att0' } },
+    { type: 'text', text: 'mid1\nmid2' },
+    { type: 'image', attachment: { id: 'att1' } },
+    { type: 'text', text: 'after' },
+  ], 'mixed runs split at each image and keep their order')
+
+  // And a second read for the same settled execution preserves the content.
+  assert.equal(def.finalizeContent(exec, { isError: false, content: fallback, value }), undefined, 'the projection is one-shot per execution')
+
+  await ctx.dispose()
+  await mock.close()
+  console.log('ok - valid mixed text/image: ordered attachment references, raw bytes preserved, structuredContent carried')
+}
+
+// 11b. Malformed base64 / unsupported MIME → nothing reaches the store at all,
+// every image in the result (including a valid sibling) falls back to a diagnostic.
+{
+  const store = makeStore((decoded) => decoded.map((_, i) => ({ id: `att${i}` })))
+  const cases = [
+    ['not base64 at all!!', 'image/png', /the image data is not canonical base64/],
+    // URL-safe alphabet + stripped padding: a valid alias, but NOT canonical RFC 4648.
+    [PNG_B64.replace(/\+/g, '-').replace(/=/g, ''), 'image/png', /not canonical base64/],
+    // Passes the alphabet/padding regex but carries non-canonical bits: 'AB=='
+    // decodes to 0x00, whose canonical encoding is 'AA=='. Only the re-encode
+    // round-trip rejects it.
+    ['AB==', 'image/png', /the image data is not canonical base64/],
+    // Declared as a number, not a string: never coerced into the base64 test.
+    [42, 'image/png', /the image data is not canonical base64/],
+    [PNG_B64, 'image/svg+xml', /the declared media type is not PNG, JPEG, WebP, or GIF/],
+    [PNG_B64, undefined, /the declared media type is not PNG, JPEG, WebP, or GIF/],
+  ]
+  for (const [data, mimeType, re] of cases) {
+    const block = { type: 'image', data }
+    if (mimeType !== undefined) block.mimeType = mimeType
+    const { mock, ctx, def } = await bridgeWithResult('image_tool', { content: [textBlock('keep me'), block, imageBlock()] })
+    const exec = ctx.exec()
+    const value = await def.execute({}, exec)
+
+    assert.equal(store.saved.length, 0, `${JSON.stringify(data).slice(0, 24)} / ${mimeType}: no image bytes reach the durable store`)
+    const finalized = def.finalizeContent(exec, { isError: false, content: def.output.render({}, value), value })
+    assert.equal(finalized.length, 3, 'text + one diagnostic per refused image')
+    assert.deepEqual(finalized[0], { type: 'text', text: 'keep me' }, 'the text half of a refused result is unchanged')
+    for (const block of finalized.slice(1)) {
+      assert.equal(block.type, 'text', 'a refused image never becomes an attachment block')
+      assert.match(block.text, /image unavailable/)
+      assert.ok(block.text.includes('raw image data remains available to programmatic callers'), 'the diagnostic promises the raw bytes survive')
+    }
+    assert.match(finalized[1].text, re, `the offending block names its own reason: ${JSON.stringify(data).slice(0, 24)}`)
+    assert.match(finalized[2].text, /another image in the same result was invalid/, 'the valid sibling says why it fell back')
+
+    await ctx.dispose()
+    await mock.close()
+  }
+  console.log('ok - malformed base64 / MIME: whole batch refused before the store, per-block diagnostics, raw bytes kept')
+}
+
+// 11c. Refusals that still reach (but never satisfy) admission: a model route
+// without image input, and no mounted attachment service.
+{
+  const store = makeStore((decoded) => decoded.map((_, i) => ({ id: `att${i}` })))
+
+  // Model does not declare image input → positive proof fails, nothing stored.
+  {
+    const ctx0 = makeImageCtx({ attachments: store, inputModalities: ['text'] })
+    const mock = await startMockMcpServer({ pages: [{ tools: [tool('image_tool')] }], callHandler: () => ({ content: [textBlock('t'), imageBlock()] }) })
+    await mod.apply(ctx0, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+    const def = ctx0.registered.get('linear_mcp_image_tool')
+    const exec = ctx0.exec()
+    const value = await def.execute({}, exec)
+    assert.equal(store.saved.length, 0, 'a non-image model route stores nothing')
+    assert.equal(ctx0.llmCalls.length, 1, 'the route was probed exactly once, with the call signal')
+    assert.equal(ctx0.llmCalls[0].signal, exec.signal, 'resolveModelInfo gets the tool-call signal so cancellation propagates')
+    const finalized = def.finalizeContent(exec, { isError: false, content: def.output.render({}, value), value })
+    assert.match(finalized[1].text, /model "fake-model" does not declare image input/)
+    await ctx0.dispose()
+    await mock.close()
+  }
+
+  // No attachment service mounted at all (ctx.get returns undefined for it).
+  {
+    const ctx0 = makeImageCtx({ attachments: undefined })
+    const mock = await startMockMcpServer({ pages: [{ tools: [tool('image_tool')] }], callHandler: () => ({ content: [textBlock('t'), imageBlock()] }) })
+    await mod.apply(ctx0, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+    const def = ctx0.registered.get('linear_mcp_image_tool')
+    const exec = ctx0.exec()
+    const value = await def.execute({}, exec)
+    const finalized = def.finalizeContent(exec, { isError: false, content: def.output.render({}, value), value })
+    assert.match(finalized[1].text, /no attachment store is mounted/)
+    await ctx0.dispose()
+    await mock.close()
+  }
+
+  // A ctx with no get() at all degrades the same way (no service lookup possible).
+  {
+    const mock = await startMockMcpServer({ pages: [{ tools: [tool('image_tool')] }], callHandler: () => ({ content: [imageBlock()] }) })
+    const bare = makeCtx()
+    await mod.apply(bare, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+    const def = bare.registered.get('linear_mcp_image_tool')
+    const exec = { signal: new AbortController().signal, agent: { options: { provider: 'p', model: 'm' } } }
+    const value = await def.execute({}, exec)
+    const finalized = def.finalizeContent(exec, { isError: false, content: def.output.render({}, value), value })
+    assert.match(finalized[0].text, /no attachment store is mounted/)
+    await bare.dispose()
+    await mock.close()
+  }
+  console.log('ok - admission refusals (model without image input, no attachment service) fall back to diagnostics and store nothing')
+}
+
+// 11d. Denial: the mounted store rejects the batch — an admission-code refusal
+// names its reason, an unexpected failure is never echoed to the model.
+{
+  const cases = [
+    [Object.assign(new Error('too many images in one result'), { code: 'TOO_MANY_IMAGES' }), /image admission rejected the result: too many images in one result/],
+    [Object.assign(new Error('image exceeds the aggregate byte budget'), { code: 'IMAGES_TOO_LARGE' }), /image admission rejected the result/],
+    [new Error('disk on fire'), /^.*durable image storage rejected the result.*$/],
+  ]
+  for (const [failure, re] of cases) {
+    const store = makeStore(() => {
+      throw failure
+    })
+    const ctx = makeImageCtx({ attachments: store })
+    const mock = await startMockMcpServer({ pages: [{ tools: [tool('image_tool')] }], callHandler: () => ({ content: [textBlock('keep'), imageBlock()] }) })
+    await mod.apply(ctx, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+    const def = ctx.registered.get('linear_mcp_image_tool')
+    const exec = ctx.exec()
+    const value = await def.execute({}, exec)
+    assert.equal(store.saved.length, 1, 'the batch reached the store once before the denial')
+    const finalized = def.finalizeContent(exec, { isError: false, content: def.output.render({}, value), value })
+    assert.deepEqual(finalized[0], { type: 'text', text: 'keep' }, 'a denied result keeps its text projection')
+    assert.equal(finalized[1].type, 'text', 'a denied image is never handed to the model as an attachment')
+    assert.match(finalized[1].text, re, `denial reason surfaces for code ${failure.code ?? '(none)'}`)
+    if (failure.code === undefined) {
+      assert.ok(!finalized[1].text.includes('disk on fire'), 'an unexpected store failure is not echoed to the model')
+    }
+    await ctx.dispose()
+    await mock.close()
+  }
+  console.log('ok - store denial: admission codes named, unexpected failures masked, text projection kept')
+}
+
+// 11e. structuredContent + image in one result must still deliver the image.
+// Regression guard for the recorded-value bug: a value recorded as { content }
+// while execute returns { content, structuredContent } fails the finalizer's
+// deep-equal and silently drops every image.
+{
+  const store = makeStore((decoded) => decoded.map((_, i) => ({ id: `att${i}` })))
+  const ctx = makeImageCtx({ attachments: store })
+  const mock = await startMockMcpServer({
+    pages: [{ tools: [tool('image_tool', { outputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'], additionalProperties: false } })] }],
+    callHandler: () => ({ content: [textBlock('caption'), imageBlock()], structuredContent: { id: 'structured-1' } }),
+  })
+  await mod.apply(ctx, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+  const def = ctx.registered.get('linear_mcp_image_tool')
+  assert.deepEqual(def.output.schema.required, ['content', 'structuredContent'], 'advertised outputSchema makes structuredContent required')
+
+  const exec = ctx.exec()
+  const value = await def.execute({}, exec)
+  const content = def.output.render({}, value)
+  const finalized = mod.projectMcpResultContent(exec, { isError: false, content, value })
+  assert.deepEqual(finalized, [
+    { type: 'text', text: 'caption' },
+    { type: 'image', attachment: { id: 'att0' } },
+  ], 'structuredContent alongside content does not defeat the projection')
+
+  // The recorded canonical value is exactly what execute returned — including
+  // structuredContent, and nothing else.
+  assert.deepEqual(value, { content: value.content, structuredContent: { id: 'structured-1' } })
+  assert.equal(Object.hasOwn(value, 'structuredContent'), true, 'the outcome carries structuredContent')
+
+  await ctx.dispose()
+  await mock.close()
+  console.log('ok - structuredContent + image: projection survives the finalizer value guard')
+}
+
+// 11f. Finalizer guards and context ownership/lifecycle, exercised through a
+// real execution (the WeakMap is keyed on the exact exec object).
+{
+  const store = makeStore((decoded) => decoded.map((_, i) => ({ id: `att${i}` })))
+  const ctx = makeImageCtx({ attachments: store })
+  // Fresh blocks per call, exactly as a real server JSON round-trips them — the
+  // two executions below must not share block objects.
+  const mock = await startMockMcpServer({ pages: [{ tools: [tool('image_tool')] }], callHandler: () => ({ content: [textBlock('t'), imageBlock()] }) })
+  await mod.apply(ctx, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+  const def = ctx.registered.get('linear_mcp_image_tool')
+
+  const exec = ctx.exec()
+  const value = await def.execute({}, exec)
+  const content = def.output.render({}, value)
+
+  // An outcome another wrapper rewrote or replaced keeps its own content.
+  assert.equal(def.finalizeContent(exec, { isError: false, content, value: { content: [textBlock('rewritten')] } }), undefined, 'a rewritten canonical value preserves the outcome content')
+  assert.equal(def.finalizeContent(exec, { isError: false, content: [{ type: 'text', text: 'someone else' }], value }), undefined, 'replaced model-visible content is preserved')
+  assert.equal(def.finalizeContent(exec, { isError: true, content, value }), undefined, 'an error outcome is left alone')
+  assert.equal(def.finalizeContent(exec, null), undefined, 'a malformed outcome never throws')
+  // The WeakMap is keyed on the exact exec object, so a second execution of the
+  // same call carries its own projection — never the first one's. And each
+  // projection is consumed by its first read: a replayed finalizer for an
+  // already-settled execution preserves that outcome's content instead of
+  // re-applying stale image references.
+  const other = ctx.exec()
+  const otherValue = await def.execute({}, other)
+  const otherContent = def.output.render({}, otherValue)
+  assert.deepEqual(mod.projectMcpResultContent(other, { isError: false, content: otherContent, value: otherValue })?.[1], { type: 'image', attachment: { id: 'att0' } }, 'the second execution carries its own projection')
+  assert.equal(mod.projectMcpResultContent(other, { isError: false, content: otherContent, value: otherValue }), undefined, 'a replayed finalizer for a settled execution preserves its content')
+  // A foreign exec (never recorded) preserves whatever it carries.
+  assert.equal(def.finalizeContent({ signal: new AbortController().signal }, { isError: false, content, value }), undefined, 'an unrecorded execution is untouched')
+  // The finalizer is total: a throwing outcome comparison cannot escape it.
+  const hostile = { isError: false, get content() { throw new Error('boom') }, value }
+  assert.equal(def.finalizeContent(other, hostile), undefined, 'the finalizer swallows an accessor throw')
+
+  await ctx.dispose()
+  await mock.close()
+  console.log('ok - finalizeContent guards (rewrite/error/foreign exec) and one-shot per-execution projection')
+}
+
+// 11g. Cancellation: admission proves the route with the call's own signal, and
+// a call canceled while that proof is in flight stores nothing — and the registry
+// replaces the outcome with its cancellation result, so no image is delivered.
+{
+  let releaseLlm
+  const store = makeStore((decoded) => decoded.map((_, i) => ({ id: `att${i}` })))
+  const ctx = makeImageCtx({ attachments: store })
+  // Replace the route probe with one that stays in flight until we release it, so
+  // the abort lands between admission's proof and the durable save.
+  ctx.get = (key) => (key === 'attachments' ? store : { async resolveModelInfo() { await new Promise((resolve) => { releaseLlm = resolve }); return { inputModalities: ['text', 'image'] } } })
+  const mock = await startMockMcpServer({ pages: [{ tools: [tool('image_tool')] }], callHandler: () => ({ content: [imageBlock()] }) })
+  await mod.apply(ctx, { mcp: { token: FAKE_TOKEN, url: mock.url } })
+  const def = ctx.registered.get('linear_mcp_image_tool')
+
+  const controller = new AbortController()
+  const exec = { signal: controller.signal, agent: { options: { provider: 'p', model: 'm' } } }
+  const executing = def.execute({}, exec)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  controller.abort()
+  releaseLlm()
+  const value = await executing
+
+  assert.equal(store.saved.length, 0, 'a call canceled during admission stores nothing')
+  // The registry hands the finalizer its cancellation outcome rather than this
+  // value, so the prepared projection is never applied and no image reaches the model.
+  const cancellation = { isError: true, content: [{ type: 'text', text: 'Tool execution was cancelled' }] }
+  assert.equal(def.finalizeContent(exec, cancellation), undefined, 'a canceled outcome keeps the cancellation content')
+
+  await ctx.dispose()
+  await mock.close()
+  console.log('ok - cancellation during admission stores nothing and delivers no image')
 }
 
 console.log('\nAll MCP bridge checks passed.')

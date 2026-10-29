@@ -38,6 +38,7 @@ import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 // The plugin source lives outside any pnpm tree, so a bare import('@deepseek-ai/dsh-tools')
 // cannot resolve from here. Every dependency is therefore requested as a STANDARD bare
@@ -1205,37 +1206,245 @@ function createMcpOutput(rawName, structuredSchema) {
   }
 }
 
-// Extract text from an MCP content array into one string (network trust
-// boundary: spec-required fields are guarded with fallbacks).
-function extractText(mcpContent, toolName) {
-  const parts = []
-  for (const value of Array.isArray(mcpContent) ? mcpContent : []) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      parts.push('[unsupported MCP content block: expected an object]')
+// ---------------------------------------------------------------------------
+// Image-result projection (parity with @deepseek-ai/dsh-mcp-client's
+// prepareImageProjection / finalizeContent pair)
+//
+// An MCP result may carry `image` blocks holding raw base64. The harness model
+// vocabulary carries images as DURABLE attachment references, not inline bytes,
+// so the bridge: (1) returns the canonical raw value unchanged — programmatic
+// callers keep every byte; (2) prepares a projection that swaps each image for
+// its stored reference through the host's own admission pipeline
+// (`ctx.attachments.saveImages`, which owns the count / aggregate-byte /
+// media-type limits); and (3) hands the harness that content at the last mile
+// through `finalizeContent`. Any refusal — an invalid block, no mounted store,
+// a model route without image input, or an admission rejection — keeps the
+// existing text projection and only replaces the image with a diagnostic.
+// Text and error behaviour are unchanged either way.
+// ---------------------------------------------------------------------------
+
+/** Raster formats the durable attachment vocabulary supports. */
+const IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+
+/** Canonical RFC 4648 base64, excluding whitespace and URL-safe aliases. */
+const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+
+/** Narrow one JSON value to a string-keyed object (untrusted MCP content). */
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Narrow a declared MIME string to the durable image vocabulary. */
+function isImageMediaType(value) {
+  return IMAGE_MEDIA_TYPES.includes(value)
+}
+
+/** Whether an untrusted MCP content array contains a declared image block. */
+function containsImage(content) {
+  return Array.isArray(content) && content.some((value) => isRecord(value) && value.type === 'image')
+}
+
+/** Decode one untrusted MCP image block without accepting base64 aliases. */
+function decodeImage(block) {
+  if (block.mimeType === undefined || !isImageMediaType(block.mimeType)) throw new Error('the declared media type is not PNG, JPEG, WebP, or GIF')
+  // `typeof` first: an untrusted block may carry a number or object where the
+  // spec declares a base64 string, and CANONICAL_BASE64.test() would coerce it.
+  if (typeof block.data !== 'string' || !CANONICAL_BASE64.test(block.data)) throw new Error('the image data is not canonical base64')
+  const data = Buffer.from(block.data, 'base64')
+  if (data.toString('base64') !== block.data) throw new Error('the image data is not canonical base64')
+  return { data, mediaType: block.mimeType }
+}
+
+/** Stable diagnostic text for an image block that was not admitted. */
+function imageDiagnostic(block, reason) {
+  return `[image unavailable: ${block?.mimeType ?? 'unknown media type'}; ${reason}; raw image data remains available to programmatic callers]`
+}
+
+/**
+ * Recognize a caller-correctable image admission refusal from the mounted
+ * attachment store WITHOUT importing @deepseek-ai/dsh-attachment: the plugin
+ * resolves its peers by absolute file:// URL, and that package is not one of
+ * them. Its AttachmentError class deliberately re-implements the HarnessError
+ * shape so consumers route on `code`, never on the prototype chain — the same
+ * rule that makes it cross duplicate package installations works across a
+ * module boundary we do not own. Codes are copied from that package's
+ * IMAGE_ADMISSION_ERROR_CODES (see THIRD_PARTY_NOTICES.md).
+ */
+const IMAGE_ADMISSION_ERROR_CODES = new Set([
+  'TOO_MANY_IMAGES',
+  'IMAGES_TOO_LARGE',
+  'UNSUPPORTED_IMAGE_TYPE',
+  'INVALID_IMAGE_BASE64',
+  'INVALID_IMAGE',
+  'IMAGE_TYPE_MISMATCH',
+  'IMAGE_TOO_LARGE',
+  'IMAGE_TOO_MANY_PIXELS',
+  'IMAGE_DIMENSION_TOO_LARGE',
+])
+
+function isImageAdmissionError(error) {
+  return error instanceof Error && typeof error.code === 'string' && IMAGE_ADMISSION_ERROR_CODES.has(error.code)
+}
+
+/**
+ * Prove that the route which will read this result accepts image input, then
+ * hand back the durable store. Positive proof only: no mounted store, an
+ * unresolvable route, or a model that does not declare image input all refuse.
+ * @param ctx - plugin context carrying optional attachment and model services.
+ * @param exec - exact tool execution whose agent supplies the latest route.
+ * @returns the mounted attachment store.
+ */
+async function resolveImageAdmission(ctx, exec) {
+  const attachments = typeof ctx?.get === 'function' ? ctx.get('attachments') : undefined
+  if (attachments === undefined) throw new Error('no attachment store is mounted')
+  const routed = exec.agent?.session?.requestHeader?.()?.config
+  const provider = routed?.provider ?? exec.agent?.options?.provider
+  const model = routed?.model ?? exec.agent?.options?.model
+  const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
+  if (provider === undefined || model === undefined || llm === undefined) throw new Error('the current model route could not be resolved')
+  let info
+  try {
+    info = await llm.resolveModelInfo(provider, model, exec.signal)
+  } catch {
+    throw new Error('the current model route could not be verified')
+  }
+  if (info?.inputModalities === undefined || !info.inputModalities.includes('image')) throw new Error(`model "${model}" does not declare image input`)
+  if (exec.signal?.aborted) throw new Error('the tool call was canceled before image storage')
+  return attachments
+}
+
+/**
+ * Project ordered MCP blocks into the core content vocabulary. Text-like runs
+ * are newline-coalesced; admitted images split those runs at their original
+ * position. This is also what `extractText` runs through, so the text half of
+ * the projection is exactly the pre-existing `extractText` string.
+ */
+function projectContent(mcpContent, toolName, image = (block) => ({ type: 'text', text: imageDiagnostic(block, 'this result was not admitted to durable model context') })) {
+  const projected = []
+  const text = []
+  const flushText = () => {
+    if (text.length === 0) return
+    projected.push({ type: 'text', text: text.splice(0).join('\n') })
+  }
+  for (const [index, value] of (Array.isArray(mcpContent) ? mcpContent : []).entries()) {
+    if (!isRecord(value)) {
+      text.push('[unsupported MCP content block: expected an object]')
       continue
     }
     switch (value.type) {
       case 'text':
-        if (value.text !== undefined) parts.push(value.text)
+        if (value.text !== undefined) text.push(value.text)
         break
       case 'image':
-        parts.push(`[image result unsupported; raw image data remains available to programmatic callers]`)
-        break
-      case 'audio':
-        parts.push(`[audio result unsupported: ${value.mimeType ?? 'unknown media type'}]`)
+        flushText()
+        projected.push(image(value, index))
         break
       case 'resource_link':
-        if (value.name === undefined || value.uri === undefined) parts.push('[resource link unavailable: the MCP block is missing its name or URI]')
-        else parts.push(`Resource link: ${value.name} (${value.uri})`)
+        if (value.name === undefined || value.uri === undefined) text.push('[resource link unavailable: the MCP block is missing its name or URI]')
+        else text.push(`Resource link: ${value.name} (${value.uri})`)
+        break
+      case 'audio':
+        text.push(`[audio result unsupported: ${value.mimeType ?? 'unknown media type'}]`)
         break
       case 'resource':
-        parts.push('[embedded resource unsupported; raw resource data remains available to programmatic callers]')
+        text.push('[embedded resource unsupported; raw resource data remains available to programmatic callers]')
         break
       default:
-        parts.push(`[unsupported MCP content type: ${value.type}]`)
+        text.push(`[unsupported MCP content type: ${value.type}]`)
     }
   }
-  return parts.length > 0 ? parts.join('\n') : `(${toolName} returned no model-visible content)`
+  flushText()
+  return projected.length > 0 ? projected : [{ type: 'text', text: `(${toolName} returned no model-visible content)` }]
+}
+
+// Extract text from an MCP content array into one string (network trust
+// boundary: spec-required fields are guarded with fallbacks).
+function extractText(mcpContent, toolName) {
+  return projectContent(mcpContent, toolName).map((block) => block.text).join('\n')
+}
+
+/**
+ * Decode, preflight, and durably save one MCP result's ordered image batch.
+ * Any refusal projects every image as text while retaining the canonical raw
+ * value for programmatic callers.
+ */
+async function prepareImageProjection(ctx, exec, content, toolName) {
+  const decoded = []
+  const validationErrors = new Map()
+  const imageIndexes = []
+  for (const [index, value] of content.entries()) {
+    if (!isRecord(value) || value.type !== 'image') continue
+    imageIndexes.push(index)
+    try {
+      decoded.push(decodeImage(value))
+    } catch (error) {
+      validationErrors.set(index, error.message)
+    }
+  }
+  if (validationErrors.size > 0) {
+    return projectContent(content, toolName, (block, index) => ({
+      type: 'text',
+      text: imageDiagnostic(block, validationErrors.get(index) ?? 'another image in the same result was invalid'),
+    }))
+  }
+  let attachments
+  try {
+    attachments = await resolveImageAdmission(ctx, exec)
+  } catch (error) {
+    const reason = error?.message ?? String(error)
+    return projectContent(content, toolName, (block) => ({ type: 'text', text: imageDiagnostic(block, reason) }))
+  }
+  try {
+    const refs = await attachments.saveImages(decoded)
+    const byIndex = new Map(imageIndexes.map((index, offset) => [index, refs[offset]]))
+    return projectContent(content, toolName, (_block, index) => ({ type: 'image', attachment: byIndex.get(index) }))
+  } catch (error) {
+    const reason = isImageAdmissionError(error) ? `image admission rejected the result: ${error.message}` : 'durable image storage rejected the result'
+    return projectContent(content, toolName, (block) => ({ type: 'text', text: imageDiagnostic(block, reason) }))
+  }
+}
+
+/**
+ * The model-facing half of one MCP result — this bridge's `finalizeContent`.
+ * It follows the upstream dsh-mcp-client shape exactly: the projection is
+ * prepared in `execute` (the only async stage of the pipeline), keyed in a
+ * module-local WeakMap on the exact `exec` object, and read back by the
+ * synchronous finalizer the registry snapshots from the REGISTERED definition
+ * at call start. Upstream's per-execution guards are preserved verbatim: an
+ * error outcome is never rewritten, and a projection is applied only when the
+ * outcome still carries what execute returned — `result.value` deep-equals the
+ * recorded canonical value AND `result.content` deep-equals the recorded
+ * rendered fallback. A result another wrapper rewrote or replaced keeps its own
+ * content (returning undefined preserves it). Each projection is consumed on the
+ * first read, exactly like upstream's `projections.delete(exec)`.
+ *   - image bytes always stay in the canonical `value` for programmatic
+ *     callers; only the model-visible content carries durable references;
+ *   - every refusal leaves the pre-existing text projection in place.
+ * The callback is total: it never throws, and returns undefined to preserve.
+ */
+
+/** Prepared projection plus the two recorded values upstream compares against. */
+const imageProjections = new WeakMap()
+
+function projectMcpResultContent(exec, result) {
+  try {
+    const prepared = imageProjections.get(exec)
+    if (prepared === undefined) return undefined
+    // One projection per execution: read it once and release the key, so a
+    // replayed finalizer for an already-settled call can never re-apply it. The
+    // WeakMap entry is inert after that anyway — its identity is the exec object
+    // the registry hands this callback, so nothing else can look it up.
+    imageProjections.delete(exec)
+    // Upstream's error guard: an outcome the registry turned into an error — a
+    // throw, or a cancellation it replaced this value with — is left alone.
+    if (result?.isError === true) return undefined
+    // Upstream's per-exec guard: the outcome still carries what execute returned.
+    if (!isDeepStrictEqual(result.value, prepared.value)) return undefined
+    if (!isDeepStrictEqual(result.content, prepared.fallback)) return undefined
+    return prepared.projected
+  } catch {
+    return undefined
+  }
 }
 
 // Credential-leak guard for diagnostics: strip anything that looks like a
@@ -1335,7 +1544,7 @@ function startMcpConnection(ctx, config) {
         if (definitions.has(publicName)) {
           throw new Error(`${label}: server listed tool "${tool.name}" more than once — invalid tool list`)
         }
-        definitions.set(publicName, createMcpDefinition(generation, sdk, publicName, tool, config))
+        definitions.set(publicName, createMcpDefinition(ctx, generation, sdk, publicName, tool, config))
       }
       cursor = response.nextCursor
       if (cursor) {
@@ -1507,7 +1716,7 @@ function startMcpConnection(ctx, config) {
 }
 
 /** Build one harness tool definition for a discovered MCP tool. */
-function createMcpDefinition(client, sdk, publicName, tool, config) {
+function createMcpDefinition(ctx, client, sdk, publicName, tool, config) {
   const rawName = tool.name
   return {
     name: publicName,
@@ -1517,6 +1726,12 @@ function createMcpDefinition(client, sdk, publicName, tool, config) {
     parameters: tool.inputSchema ?? {},
     output: createMcpOutput(rawName, supportedOutputSchema(tool.outputSchema)),
     timeoutMs: config.toolCallTimeoutMs ?? DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS,
+    // Last-mile model-facing projection for image-bearing results (see
+    // projectMcpResultContent). Declared on the definition so the registry
+    // snapshots it per execution; the value it never touches stays canonical.
+    finalizeContent(exec, result) {
+      return projectMcpResultContent(exec, result)
+    },
     async execute(args, exec) {
       const result = await client.request(
         { method: 'tools/call', params: { name: rawName, arguments: typeof args === 'object' && args !== null ? args : {} } },
@@ -1526,8 +1741,33 @@ function createMcpDefinition(client, sdk, publicName, tool, config) {
         { signal: exec.signal, timeout: config.toolCallTimeoutMs ?? DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS },
       )
       if (result.isError === true) throw new Error(redactSecrets(extractText(result.content, rawName)))
+      const content = Array.isArray(result.content) ? result.content : []
+      // Awaited HERE — the only async stage of the pipeline. finalizeContent is
+      // synchronous, so a projection started there could never land: an
+      // image-bearing result must be projected before this body returns.
+      if (containsImage(content)) {
+        const projected = await prepareImageProjection(ctx, exec, content, rawName)
+        // Keyed on the exact execution the registry snapshots its finalizer for.
+        // The two recorded values are what the finalizer compares the outcome
+        // against: this body's canonical value, and the model-visible fallback —
+        // `render` is createMcpOutput's text-only projection of that same value,
+        // so its snapshot equals this one block array. A structuredContent field
+        // rides alongside `content` in the value but never in the rendered
+        // content, so it is recorded on the value half only.
+        // The recorded value must be EXACTLY what this body returns below —
+        // the finalizer deep-equals `result.value` against it, so a recorded
+        // `{ content }` never matches an outcome that carries structuredContent
+        // alongside it, and the projection would be silently dropped (the model
+        // would see the text diagnostic while the raw bytes stayed canonical).
+        const value = {
+          content,
+          ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
+        }
+        imageProjections.set(exec, { projected, value, fallback: [{ type: 'text', text: extractText(content, rawName) }] })
+        return value
+      }
       return {
-        content: Array.isArray(result.content) ? result.content : [],
+        content,
         ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
       }
     },
@@ -1638,4 +1878,12 @@ export {
   resolveReconnectPolicy,
   startMcpConnection,
   supportedOutputSchema,
+  // Image-result projection internals (test-visible)
+  decodeImage,
+  containsImage,
+  imageDiagnostic,
+  isImageAdmissionError,
+  prepareImageProjection,
+  projectContent,
+  projectMcpResultContent,
 }
