@@ -293,6 +293,12 @@ described under [Install](#install).
   the **DSH plugin manager** and verified on **desktop runtime 0.2.1-rc.3** with the
   Cordis loader plus `ToolRuntime` — a bare host context, **not** a full desktop app
   boot: no LLM turn, session log, sandbox, or app entry tree was started.
+- **Verified (CLI install smoke, separate from the line above):** a clean scratch
+  profile based on the **shipped headless template** took the **packed** plugin through
+  `dsh plugin`, and `dsh --profile <scratch> --help` exited **0** on **Windows CLI
+  0.1.5-rc.2**. That is an install-and-launch smoke check only: no model turn and no
+  full desktop GUI boot were performed, and it says nothing about the loader/`ToolRuntime`
+  run above, which was on desktop runtime 0.2.1-rc.3.
 - **Verified against live services:** the hosted MCP bridge has been checked against
   the real `https://mcp.linear.app/mcp` endpoint — a real run through the DSH
   `ToolRuntime`, installing this package from a clean scratch package, discovered
