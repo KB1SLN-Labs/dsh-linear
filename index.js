@@ -4,47 +4,58 @@
 // export — a stray default collapses the module via the Loader's unwrapExports).
 // `apply` registers model-facing tools through ctx.tools.register.
 //
-// Two tool surfaces:
-//   1. GraphQL tools (linear_*): talk to the Linear GraphQL API with a personal
-//      API token (env LINEAR_API_KEY or config apiKey). Unchanged behaviour.
-//   2. MCP parity tools (linear_mcp_*): dynamic bridge to Linear's HOSTED MCP
-//      server over the official Streamable HTTP transport
-//      (https://mcp.linear.app/mcp). Tool schemas are DISCOVERED at runtime via
-//      `tools/list` and every call is forwarded with `tools/call` using the raw
-//      wire name. Credentials are never embedded in tool definitions or names.
+// One tool surface:
+//   GraphQL tools (linear_*): 26 hand-written tools that talk to the Linear
+//   GraphQL API (https://api.linear.app/graphql) with a personal API token
+//   (env LINEAR_API_KEY or config apiKey). There is no MCP server and no MCP
+//   client here — no connection to mcp.linear.app is ever opened, and no MCP
+//   configuration exists. The 26 tools below are the entire surface.
 //
-// Peer deps (@deepseek-ai/dsh-tools, @deepseek-ai/cordis, the MCP SDK) resolve
+// Peer deps (@deepseek-ai/dsh-tools, @deepseek-ai/cordis) resolve
 // from the dsh install's node_modules — this file lives outside any pnpm tree,
 // so a plain import would not find them; the resolvers below pin resolution to
 // the dsh install root by absolute file:// URL.
 //
 // GraphQL tools:
-//   linear_issue_list    — list issues (filter by team, state, search, limit)
-//   linear_issue_get     — one issue by id or identifier (e.g. "APT-123")
-//   linear_issue_create  — create an issue in a team
-//   linear_issue_update  — update an issue (state, description, assignee, labels, priority)
-//   linear_comment_add   — add a comment to an issue
-//   linear_comment_list  — list comments on an issue
-//   linear_relation_add  — link a related issue to an issue
-//   linear_team_list     — list teams
-//   linear_state_list    — list workflow states for a team
-//   linear_label_list    — list labels for a team
-//   linear_project_list  — list projects
-//   linear_project_create— create a project
-//   linear_label_create  — create a label for a team
+//   linear_issue_list      — list issues (filter by team, state, search, limit, cursor pagination)
+//   linear_issue_get       — one issue by id or identifier (e.g. "APT-123")
+//   linear_issue_create    — create an issue in a team
+//   linear_issue_update    — update an issue (state, description, assignee, labels, priority)
+//   linear_issue_archive   — archive an issue (id or identifier)
+//   linear_issue_unarchive — unarchive a previously archived issue
+//   linear_comment_add     — add a comment to an issue
+//   linear_comment_update  — update a comment body (comment UUID)
+//   linear_comment_delete  — delete a comment (comment UUID)
+//   linear_comment_list    — list comments on an issue (cursor pagination)
+//   linear_relation_add    — link a related issue to an issue
+//   linear_team_list       — list teams
+//   linear_team_get        — one team by id (UUID) or key
+//   linear_state_list      — list workflow states for a team
+//   linear_label_list      — list labels for a team
+//   linear_label_get       — one label by id (UUID)
+//   linear_label_create    — create a label for a team
+//   linear_project_list    — list projects
+//   linear_project_get     — one project by id (UUID)
+//   linear_project_create  — create a project
+//   linear_project_update  — update a project (name, description, content, dates, teams)
+//   linear_cycle_list      — list cycles for a team
+//   linear_cycle_get       — one cycle by id (UUID)
+//   linear_user_list       — list users in the workspace
+//   linear_user_get        — one user by id (UUID) or email
+//   linear_graphql         — direct GraphQL escape hatch (caller's own query or
+//                            mutation document; coverage is whatever the Linear
+//                            API exposes to the key, not named-tool parity)
 
-import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { isDeepStrictEqual } from 'node:util'
 
 // The plugin source lives outside any pnpm tree, so a bare import('@deepseek-ai/dsh-tools')
 // cannot resolve from here. Every dependency is therefore requested as a STANDARD bare
-// specifier ('@deepseek-ai/dsh-tools', '@deepseek-ai/schemastery', 'zod/v4',
-// '@modelcontextprotocol/sdk/...') and resolved through the packages' own "exports" maps —
-// never through a hardcoded entry filename. Node's own resolver walks up from this file, so
+// specifier ('@deepseek-ai/dsh-tools', '@deepseek-ai/schemastery') and resolved through the
+// packages' own "exports" maps — never through a hardcoded entry filename. Node's own resolver
+// walks up from this file, so
 // when the plugin is installed inside a tree that carries these packages (or one of their
 // peer locations), plain resolution finds them with no anchoring at all. Only when that
 // fails do we fall back to resolving from the dsh install root, derived portably from
@@ -120,45 +131,21 @@ function fallbackNodeModulesRoots() {
  *
  * Peer dependencies are declared as BOTH `dependencies` and `peerDependencies`, because
  * either location may be what Node finds — a copy installed next to this plugin, or the host
- * dsh install's copy. Whichever tree plain resolution lands on must serve every member of a
- * group below: for the MCP SDK that matters beyond version skew, since its zod-backed
- * schemas are identity-sensitive. So if plain resolution provides one member of a group, all
- * members are re-resolved from that same anchor and cached together; if plain resolution
- * provides none of them, the first anchored tree that provides the whole group serves it.
+ * dsh install's copy.
  */
 function resolveEntry(override, specifier) {
   if (override) return override
-  const group = CONSISTENCY_GROUPS.find((g) => g.includes(specifier))
-  if (!group) return tryResolveFrom(selfPath, specifier) ?? specifier
-  if (groupCache.has(specifier)) return groupCache.get(specifier)
-  // Anchors in preference order: this plugin's own tree first (that is what a plain bare
-  // import would get), then the dsh install, then each npm-global fallback root.
-  const anchors = [selfPath, dshInstallAnchor(), ...fallbackNodeModulesRoots().map((root) => join(root, 'noop.js'))].filter(Boolean)
-  for (const anchor of anchors) {
-    if (resolveGroup(anchor, group)) return groupCache.get(specifier)
+  return tryResolveFrom(selfPath, specifier) ?? tryResolveFrom(dshInstallAnchor(), specifier) ?? tryResolveFromFromRoots(specifier) ?? specifier
+}
+
+/** Last resort: the same bare specifier resolved from each npm-global fallback root. */
+function tryResolveFromFromRoots(specifier) {
+  for (const root of fallbackNodeModulesRoots()) {
+    const entry = tryResolveFrom(join(root, 'noop.js'), specifier)
+    if (entry !== undefined) return entry
   }
-  // No tree provided the complete group: fall back to plain resolution per member.
-  return tryResolveFrom(selfPath, specifier) ?? specifier
+  return undefined
 }
-
-/** Specifier groups that must come from one and the same tree (see resolveEntry). */
-const CONSISTENCY_GROUPS = [
-  ['@modelcontextprotocol/sdk/client/index.js', '@modelcontextprotocol/sdk/client/streamableHttp.js', '@modelcontextprotocol/sdk/types.js', 'zod/v4'],
-]
-
-/**
- * Resolve every member of `group` from `anchor`; on a complete hit, cache all members and
- * return true. A partial tree pins nothing — incomplete groups are no better than resolving
- * each specifier independently.
- */
-function resolveGroup(anchor, group) {
-  const resolved = group.map((member) => tryResolveFrom(anchor, member))
-  if (resolved.some((entry) => entry === undefined)) return false
-  for (let i = 0; i < group.length; i += 1) if (!groupCache.has(group[i])) groupCache.set(group[i], resolved[i])
-  return true
-}
-
-const groupCache = new Map()
 
 function resolveDshToolsEntry() {
   return resolveEntry(process.env.DSH_LINEAR_TOOLS, '@deepseek-ai/dsh-tools')
@@ -169,35 +156,7 @@ function resolveDshSchemasteryEntry() {
   return resolveEntry(process.env.DSH_LINEAR_SCHEMA, '@deepseek-ai/schemastery')
 }
 
-// The official MCP SDK — the same package the harness's own
-// @deepseek-ai/dsh-mcp-client bridge depends on, so we reuse the installed copy
-// rather than inventing a transport. Subpaths come from the SDK's own "exports" map
-// instead of a pinned dist path. Resolution is overridable for tests via
-// DSH_LINEAR_MCP_SDK (client/index.js), DSH_LINEAR_MCP_SDK_TYPES (types.js),
-// and DSH_LINEAR_MCP_SDK_TRANSPORT (client/streamableHttp.js).
-// NOTE: in @modelcontextprotocol/sdk 1.x, StreamableHTTPClientTransport lives
-// in client/streamableHttp.js, NOT client/index.js (which exports only Client)
-// — dsh-mcp-client imports it from the same place.
-function resolveMcpSdkClientEntry() {
-  return resolveEntry(process.env.DSH_LINEAR_MCP_SDK, '@modelcontextprotocol/sdk/client/index.js')
-}
-
-function resolveMcpSdkTransportEntry() {
-  return resolveEntry(process.env.DSH_LINEAR_MCP_SDK_TRANSPORT, '@modelcontextprotocol/sdk/client/streamableHttp.js')
-}
-
-function resolveMcpSdkTypesEntry() {
-  return resolveEntry(process.env.DSH_LINEAR_MCP_SDK_TYPES, '@modelcontextprotocol/sdk/types.js')
-}
-
-// The zod the SDK itself resolves to (`import * as z from 'zod/v4'`, hoisted
-// next to it in the dsh install), so RawCallToolResultSchema is built with the
-// same zod major as the SDK's schemas. DSH_LINEAR_MCP_SDK_ZOD overrides it.
-function resolveMcpSdkZodEntry() {
-  return resolveEntry(process.env.DSH_LINEAR_MCP_SDK_ZOD, 'zod/v4')
-}
-
-const { defineTool, assertSupportedJsonSchema } = await import(resolveDshToolsEntry())
+const { defineTool } = await import(resolveDshToolsEntry())
 // schemastery's exports map serves the ESM entry to an import in a tree that provides it;
 // resolved from the dsh install root the same specifier may land on its CJS entry, which
 // Node wraps with both `default` and the named bindings. Take whichever shape is real.
@@ -251,6 +210,12 @@ const ISSUE_FIELDS = `
   url
 `
 
+// Connection pagination block for list connections (issues, comments). Every
+// direct list tool that supports `after` requests this alongside `nodes`.
+const PAGE_INFO_FIELDS = `
+  pageInfo { hasNextPage endCursor }
+`
+
 const COMMENT_FIELDS = `
   id body createdAt
 `
@@ -287,6 +252,26 @@ const USER_FIELDS = `
 // ---------------------------------------------------------------------------
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// Cursor pagination (direct GraphQL list tools).
+//
+// `after` is an optional opaque cursor: it is ALWAYS sent as a GraphQL variable
+// (`$after: String`), never interpolated into the query text, so a cursor can
+// never alter the document. When no cursor is supplied the declaration and the
+// `after:` argument are both omitted, which keeps the wire request byte-identical
+// to the pre-pagination form (backwards compatibility). Every direct list tool
+// uses this shape: linear_issue_list, linear_comment_list, linear_team_list,
+// linear_state_list, linear_label_list, linear_project_list, linear_cycle_list
+// and linear_user_list.
+// The result shape mirrors GraphQL's PageInfo — null when the server did not
+// report one, so an older/blank response never invents pagination state.
+function normalizePageInfo(pageInfo) {
+  if (!pageInfo || typeof pageInfo !== 'object') return null
+  return {
+    hasNextPage: pageInfo.hasNextPage === true,
+    endCursor: typeof pageInfo.endCursor === 'string' ? pageInfo.endCursor : null,
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Entity resolution (resolve-then-mutate)
@@ -343,22 +328,100 @@ async function resolveStateId(key, teamId, stateName) {
   return nodes[0].id
 }
 
+// Resolve a project name or a UUID to a Linear project UUID. The singular
+// `project` field accepts ONLY a UUID id, so a name goes through the PLURAL
+// `projects` field (which takes a ProjectFilter). Unlike teams, a non-UUID that
+// simply matches nothing returns null here rather than throwing, so the caller
+// renders the same `Project not found: <x>` shape the read tools use.
+// More than one node is NOT silently shortened to the first one: an update aimed
+// at an ambiguous name could modify the wrong project, so it throws and
+// resolveLinearProjectId turns that into a clean { error } before any mutation.
+async function findProjectId(key, ref) {
+  if (UUID_RE.test(ref)) return ref
+  const data = await gql(key, `
+    query($name: String!) {
+      projects(filter: { name: { eq: $name } }) {
+        nodes { id }
+      }
+    }
+  `, { name: ref })
+  const nodes = data.projects?.nodes ?? []
+  if (nodes.length > 1) {
+    throw new Error(`Project name '${ref}' is ambiguous (resolved ${nodes.length} projects via the projects filter); use the project id (UUID) instead`)
+  }
+  return nodes[0]?.id ?? null
+}
+
+// findProjectId with its two failure shapes rendered for a tool: `null` means
+// genuinely not found, and an ambiguity throw becomes its own clean error string.
+async function resolveLinearProjectId(key, ref) {
+  try {
+    const projectId = await findProjectId(key, ref)
+    return { projectId }
+  } catch (err) {
+    if (/is ambiguous/.test(err?.message ?? '')) {
+      return { error: `Project name '${ref}' matched multiple projects — refine the name or use the project id (UUID)` }
+    }
+    throw err
+  }
+}
+
 // Resolve a human identifier ("APT-804") or a UUID to a Linear issue UUID.
 // IssueFilter has no `identifier` field, so we split the identifier into
 // team key + number and look the issue up by those, then return its id.
-async function findIssueId(key, id) {
+// `includeArchived` opts into IssuesQuery.includeArchived: an ARCHIVED issue is
+// invisible to the plain issues query, so a tool that must reach one (only
+// linear_issue_unarchive) passes it. Every other caller omits the option, which
+// keeps the document byte-for-byte what it was before — no extra argument and
+// no extra variable are sent when includeArchived is falsy.
+async function findIssueId(key, id, { includeArchived = false } = {}) {
   if (UUID_RE.test(id)) return id
   const m = id.match(/^(.+?)-(\d+)$/)
   if (!m) return null
   const [, teamKey, num] = m
   const data = await gql(key, `
     query($team: String!, $num: Float!) {
-      issues(filter: { team: { key: { eq: $team } }, number: { eq: $num } }) {
+      issues(filter: { team: { key: { eq: $team } }, number: { eq: $num } }${includeArchived ? ', includeArchived: true' : ''}) {
         nodes { id }
       }
     }
   `, { team: teamKey, num: Number(num) })
   return data.issues.nodes[0]?.id ?? null
+}
+
+// Shared body for linear_issue_archive / linear_issue_unarchive. Both mutations
+// take a bare `id` argument (there is no IssueArchiveInput type) and both return
+// IssueArchivePayload { success entity lastSyncId } — the archived issue comes
+// back under `entity`, NOT `issue` (verified by introspection). The identifier is
+// resolved to a UUID first, so an unknown "APT-999" fails before any mutation.
+// Unarchiving resolves the identifier with includeArchived: true, because an
+// archived issue is exactly what the plain issues query hides — without it the
+// tool could never unarchive anything it identified by name. Archiving keeps the
+// ordinary lookup (an archived issue needs no second archive).
+async function archiveIssue(key, id, unarchive) {
+  const issueId = await findIssueId(key, id, { includeArchived: unarchive })
+  if (!issueId) return JSON.stringify({ error: `Issue not found: ${id}` })
+  const mutation = unarchive ? 'issueUnarchive' : 'issueArchive'
+  const data = await gql(key, `
+    mutation($id: String!) {
+      ${mutation}(id: $id) {
+        success entity { ${ISSUE_FIELDS} }
+      }
+    }
+  `, { id: issueId })
+  const payload = data[mutation]
+  if (!payload?.success) return JSON.stringify({ error: `${mutation} failed` })
+  const i = payload.entity
+  if (!i) return JSON.stringify({ ok: true, archived: !unarchive })
+  return JSON.stringify({
+    ok: true,
+    archived: !unarchive,
+    id: i.id,
+    identifier: i.identifier,
+    title: i.title,
+    state: i.state?.name,
+    url: i.url,
+  }, null, 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -392,12 +455,13 @@ function registerLinearTools(ctx, config) {
     defineTool({
       name: 'linear_issue_list',
       description:
-        'List Linear issues. Optionally filter by team key (e.g. "APT"), state name, or free-text search. Returns up to `limit` most recent issues (default 20, max 50).',
+        'List Linear issues. Optionally filter by team key (e.g. "APT"), state name, or free-text search. Returns up to `limit` most recent issues (default 20, max 50). Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
       parameters: {
         team: { type: 'string', description: 'Team key to filter by, e.g. "APT"' },
         state: { type: 'string', description: 'State name to filter by, e.g. "Done", "In Progress"' },
         search: { type: 'string', description: 'Free-text search across title/description' },
         limit: { type: 'number', description: 'Max issues to return (default 20, max 50)' },
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
       },
       output: {
         schema: { type: 'string' },
@@ -405,18 +469,25 @@ function registerLinearTools(ctx, config) {
       },
       async execute(args) {
         const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 20)), 50)
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
         const filterParts = []
         const vars = {}
         if (args.team) { filterParts.push(`team: { key: { eq: $team } }`); vars.team = args.team }
         if (args.state) { filterParts.push(`state: { name: { eq: $state } }`); vars.state = args.state }
         if (args.search) { filterParts.push(`OR: { title: { containsInsensitive: $search }, description: { containsInsensitive: $search } }`); vars.search = args.search }
         const filter = filterParts.length ? `filter: { ${filterParts.join(', ')} }` : ''
+        if (after !== undefined) vars.after = after
         const usedVars = Object.keys(vars)
         const varDecl = usedVars.length ? `query(${usedVars.map((v) => `$${v}: String`).join(', ')})` : 'query'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = [filter, after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
         const data = await gql(key(), `
           ${varDecl} {
-            issues(first: ${limit}, ${filter}) {
+            issues(first: ${limit}${argList ? `, ${argList}` : ''}) {
               nodes { ${ISSUE_FIELDS} }
+              ${PAGE_INFO_FIELDS}
             }
           }
         `, vars)
@@ -431,7 +502,7 @@ function registerLinearTools(ctx, config) {
           labels: i.labels.nodes.map((l) => l.name),
           url: i.url,
         }))
-        return JSON.stringify({ count: issues.length, issues }, null, 2)
+        return JSON.stringify({ count: issues.length, issues, pageInfo: normalizePageInfo(data.issues.pageInfo) }, null, 2)
       },
     }),
   )
@@ -590,6 +661,41 @@ function registerLinearTools(ctx, config) {
     }),
   )
 
+  register(
+    defineTool({
+      name: 'linear_issue_archive',
+      description:
+        'Archive a Linear issue by id (UUID) or identifier. Archived issues leave the team\'s default views. To bring an archived issue back, use the separate linear_issue_unarchive tool — this tool takes no unarchive argument.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Issue id (UUID) or identifier' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_a, v) => [{ type: 'text', text: v }],
+      },
+      async execute(args) {
+        return archiveIssue(key(), args.id, false)
+      },
+    }),
+  )
+
+  register(
+    defineTool({
+      name: 'linear_issue_unarchive',
+      description: 'Unarchive a previously archived Linear issue by id (UUID) or identifier, returning it to the team\'s views.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Issue id (UUID) or identifier' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_a, v) => [{ type: 'text', text: v }],
+      },
+      async execute(args) {
+        return archiveIssue(key(), args.id, true)
+      },
+    }),
+  )
+
   // -- Comments ---------------------------------------------------------------
 
   register(
@@ -623,10 +729,11 @@ function registerLinearTools(ctx, config) {
   register(
     defineTool({
       name: 'linear_comment_list',
-      description: 'List comments on a Linear issue (by id or identifier), newest first.',
+      description: 'List comments on a Linear issue (by id or identifier), newest first. Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
       parameters: {
         issue: { type: 'string', required: true, description: 'Issue id or identifier' },
         limit: { type: 'number', description: 'Max comments (default 20, max 50)' },
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
       },
       output: {
         schema: { type: 'string' },
@@ -634,24 +741,91 @@ function registerLinearTools(ctx, config) {
       },
       async execute(args) {
         const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 20)), 50)
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
         const issueId = await findIssueId(key(), args.issue)
         if (!issueId) return JSON.stringify({ error: `Issue not found: ${args.issue}` })
+        const vars = { id: issueId }
+        if (after !== undefined) vars.after = after
+        const varDecl = after !== undefined ? 'query($id: String!, $after: String)' : 'query($id: String!)'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = after !== undefined ? 'after: $after' : ''
         const data = await gql(key(), `
-          query($id: String!) {
+          ${varDecl} {
             issue: issue(id: $id) {
               id
-              comments(first: ${limit}) {
+              comments(first: ${limit}${argList ? `, ${argList}` : ''}) {
                 nodes { ${COMMENT_FIELDS} }
+                ${PAGE_INFO_FIELDS}
               }
             }
           }
-        `, { id: issueId })
+        `, vars)
         if (!data.issue) return JSON.stringify({ error: `Issue not found: ${args.issue}` })
         return JSON.stringify({
           issue: args.issue,
           count: data.issue.comments.nodes.length,
           comments: data.issue.comments.nodes,
+          pageInfo: normalizePageInfo(data.issue.comments.pageInfo),
         }, null, 2)
+      },
+    }),
+  )
+
+  register(
+    defineTool({
+      name: 'linear_comment_update',
+      description: 'Update the body of an existing comment on a Linear issue. `id` is the comment UUID (from linear_comment_list); `body` is the new markdown body.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Comment id (UUID)' },
+        body: { type: 'string', required: true, description: 'New comment body (markdown)' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_a, v) => [{ type: 'text', text: v }],
+      },
+      async execute(args) {
+        // CommentUpdateInput carries only the changed fields; the comment UUID is
+        // a top-level `id` argument on the mutation (verified by introspection).
+        const data = await gql(key(), `
+          mutation($id: String!, $input: CommentUpdateInput!) {
+            commentUpdate(id: $id, input: $input) {
+              success comment { ${COMMENT_FIELDS} }
+            }
+          }
+        `, { id: args.id, input: { body: args.body } })
+        if (!data.commentUpdate.success) return JSON.stringify({ error: 'commentUpdate failed' })
+        const c = data.commentUpdate.comment
+        return JSON.stringify({ id: c?.id, body: c?.body }, null, 2)
+      },
+    }),
+  )
+
+  register(
+    defineTool({
+      name: 'linear_comment_delete',
+      description: 'Delete a comment from a Linear issue by its comment id (UUID, from linear_comment_list). This is destructive and cannot be undone.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Comment id (UUID)' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_a, v) => [{ type: 'text', text: v }],
+      },
+      async execute(args) {
+        // commentDelete takes a bare `id` argument — there is NO CommentDeleteInput
+        // type in the Linear schema (verified by introspection). Its payload is
+        // DeletePayload { success entityId lastSyncId } — no entity object.
+        const data = await gql(key(), `
+          mutation($id: String!) {
+            commentDelete(id: $id) {
+              success entityId
+            }
+          }
+        `, { id: args.id })
+        if (!data.commentDelete.success) return JSON.stringify({ error: 'commentDelete failed' })
+        return JSON.stringify({ ok: true, deletedId: data.commentDelete.entityId ?? args.id }, null, 2)
       },
     }),
   )
@@ -702,21 +876,32 @@ function registerLinearTools(ctx, config) {
   register(
     defineTool({
       name: 'linear_team_list',
-      description: 'List all Linear teams (key, name, description).',
-      parameters: {},
+      description: 'List all Linear teams (key, name, description). Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
+      parameters: {
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
+      },
       output: {
         schema: { type: 'string' },
         render: (_a, v) => [{ type: 'text', text: v }],
       },
-      async execute() {
+      async execute(args) {
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
+        const vars = {}
+        if (after !== undefined) vars.after = after
+        const varDecl = after !== undefined ? 'query($after: String)' : 'query'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
         const data = await gql(key(), `
-          {
-            teams(first: 100) {
+          ${varDecl} {
+            teams(first: 100${argList ? `, ${argList}` : ''}) {
               nodes { ${TEAM_FIELDS} }
+              ${PAGE_INFO_FIELDS}
             }
           }
-        `)
-        return JSON.stringify({ count: data.teams.nodes.length, teams: data.teams.nodes }, null, 2)
+        `, vars)
+        return JSON.stringify({ count: data.teams.nodes.length, teams: data.teams.nodes, pageInfo: normalizePageInfo(data.teams.pageInfo) }, null, 2)
       },
     }),
   )
@@ -724,27 +909,37 @@ function registerLinearTools(ctx, config) {
   register(
     defineTool({
       name: 'linear_state_list',
-      description: 'List workflow states for a team (e.g. Todo, In Progress, Done).',
+      description: 'List workflow states for a team (e.g. Todo, In Progress, Done). Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
       parameters: {
         team: { type: 'string', required: true, description: 'Team key, e.g. "APT"' },
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
       },
       output: {
         schema: { type: 'string' },
         render: (_a, v) => [{ type: 'text', text: v }],
       },
       async execute(args) {
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
         // Resolve the team to a UUID via the PLURAL `teams` field (the singular
         // `team` field takes only a UUID id), then list that team's states via
         // the top-level `workflowStates` field filtered by team id.
         const teamId = await resolveTeamId(key(), args.team)
+        const vars = { teamId }
+        if (after !== undefined) vars.after = after
+        const varDecl = after !== undefined ? 'query($teamId: String!, $after: String)' : 'query($teamId: String!)'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
         const data = await gql(key(), `
-          query($teamId: String!) {
-            workflowStates(filter: { team: { id: { eq: $teamId } } }) {
+          ${varDecl} {
+            workflowStates(filter: { team: { id: { eq: $teamId } } }${argList ? `, ${argList}` : ''}) {
               nodes { ${STATE_FIELDS} }
+              ${PAGE_INFO_FIELDS}
             }
           }
-        `, { teamId })
-        return JSON.stringify({ team: args.team, states: data.workflowStates.nodes }, null, 2)
+        `, vars)
+        return JSON.stringify({ team: args.team, states: data.workflowStates.nodes, pageInfo: normalizePageInfo(data.workflowStates.pageInfo) }, null, 2)
       },
     }),
   )
@@ -752,24 +947,34 @@ function registerLinearTools(ctx, config) {
   register(
     defineTool({
       name: 'linear_label_list',
-      description: 'List labels for a team.',
+      description: 'List labels for a team. Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
       parameters: {
         team: { type: 'string', required: true, description: 'Team key, e.g. "APT"' },
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
       },
       output: {
         schema: { type: 'string' },
         render: (_a, v) => [{ type: 'text', text: v }],
       },
       async execute(args) {
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
         const teamId = await resolveTeamId(key(), args.team)
+        const vars = { teamId }
+        if (after !== undefined) vars.after = after
+        const varDecl = after !== undefined ? 'query($teamId: String!, $after: String)' : 'query($teamId: String!)'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
         const data = await gql(key(), `
-          query($teamId: String!) {
-            issueLabels(filter: { team: { id: { eq: $teamId } } }) {
+          ${varDecl} {
+            issueLabels(filter: { team: { id: { eq: $teamId } } }${argList ? `, ${argList}` : ''}) {
               nodes { ${LABEL_FIELDS} }
+              ${PAGE_INFO_FIELDS}
             }
           }
-        `, { teamId })
-        return JSON.stringify({ team: args.team, labels: data.issueLabels.nodes }, null, 2)
+        `, vars)
+        return JSON.stringify({ team: args.team, labels: data.issueLabels.nodes, pageInfo: normalizePageInfo(data.issueLabels.pageInfo) }, null, 2)
       },
     }),
   )
@@ -777,9 +982,10 @@ function registerLinearTools(ctx, config) {
   register(
     defineTool({
       name: 'linear_project_list',
-      description: 'List Linear projects (name, description, state, teams).',
+      description: 'List Linear projects (name, description, state, teams). Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
       parameters: {
         limit: { type: 'number', description: 'Max projects (default 20, max 50)' },
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
       },
       output: {
         schema: { type: 'string' },
@@ -787,14 +993,23 @@ function registerLinearTools(ctx, config) {
       },
       async execute(args) {
         const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 20)), 50)
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
+        const vars = {}
+        if (after !== undefined) vars.after = after
+        const varDecl = after !== undefined ? 'query($after: String)' : 'query'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
         const data = await gql(key(), `
-          {
-            projects(first: ${limit}) {
+          ${varDecl} {
+            projects(first: ${limit}${argList ? `, ${argList}` : ''}) {
               nodes { ${PROJECT_FIELDS} }
+              ${PAGE_INFO_FIELDS}
             }
           }
-        `)
-        return JSON.stringify({ count: data.projects.nodes.length, projects: data.projects.nodes }, null, 2)
+        `, vars)
+        return JSON.stringify({ count: data.projects.nodes.length, projects: data.projects.nodes, pageInfo: normalizePageInfo(data.projects.pageInfo) }, null, 2)
       },
     }),
   )
@@ -828,6 +1043,63 @@ function registerLinearTools(ctx, config) {
         `, { input })
         if (!data.projectCreate.success) return JSON.stringify({ error: 'projectCreate failed' })
         return JSON.stringify(data.projectCreate.project, null, 2)
+      },
+    }),
+  )
+
+  register(
+    defineTool({
+      name: 'linear_project_update',
+      description:
+        'Update a Linear project by id (UUID) or exact name. Any of: name, description, content, icon, color, team keys, start date, target date, priority.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Project id (UUID) or exact project name' },
+        name: { type: 'string', description: 'New project name' },
+        description: { type: 'string', description: 'New project description' },
+        content: { type: 'string', description: 'New project content (markdown)' },
+        icon: { type: 'string', description: 'Project icon identifier, e.g. "Rocket"' },
+        color: { type: 'string', description: 'Hex color, e.g. "#ff0000"' },
+        teams: { type: 'array', items: { type: 'string' }, description: 'Team keys to set (replaces existing)' },
+        startDate: { type: 'string', description: 'Start date, YYYY-MM-DD' },
+        targetDate: { type: 'string', description: 'Target date, YYYY-MM-DD' },
+        priority: { type: 'number', description: 'Priority 0 (none) to 4 (urgent)' },
+      },
+      output: {
+        schema: { type: 'string' },
+        render: (_a, v) => [{ type: 'text', text: v }],
+      },
+      async execute(args) {
+        // A name that matches more than one project never reaches the mutation —
+        // resolveLinearProjectId answers with a clean ambiguity error instead.
+        const resolved = await resolveLinearProjectId(key(), args.id)
+        if (resolved.error) return JSON.stringify({ error: resolved.error })
+        const projectId = resolved.projectId
+        if (!projectId) return JSON.stringify({ error: `Project not found: ${args.id}` })
+
+        // ProjectUpdateInput is flat (teamIds are UUIDs), and the mutation takes
+        // the project UUID as a top-level `id` argument alongside `input`.
+        const input = {}
+        if (args.name !== undefined) input.name = args.name
+        if (args.description !== undefined) input.description = args.description
+        if (args.content !== undefined) input.content = args.content
+        if (args.icon !== undefined) input.icon = args.icon
+        if (args.color !== undefined) input.color = args.color
+        if (args.startDate !== undefined) input.startDate = args.startDate
+        if (args.targetDate !== undefined) input.targetDate = args.targetDate
+        if (args.priority !== undefined) input.priority = args.priority
+        if (args.teams !== undefined) {
+          input.teamIds = await Promise.all((args.teams ?? []).map((t) => resolveTeamId(key(), t)))
+        }
+
+        const data = await gql(key(), `
+          mutation($id: String!, $input: ProjectUpdateInput!) {
+            projectUpdate(id: $id, input: $input) {
+              success project { ${PROJECT_FIELDS} }
+            }
+          }
+        `, { id: projectId, input })
+        if (!data.projectUpdate.success) return JSON.stringify({ error: 'projectUpdate failed' })
+        return JSON.stringify(data.projectUpdate.project, null, 2)
       },
     }),
   )
@@ -874,10 +1146,11 @@ function registerLinearTools(ctx, config) {
   register(
     defineTool({
       name: 'linear_cycle_list',
-      description: 'List cycles for a team. Returns up to `limit` most recent cycles (default 20, max 50).',
+      description: 'List cycles for a team. Returns up to `limit` most recent cycles (default 20, max 50). Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
       parameters: {
         team: { type: 'string', required: true, description: 'Team key, e.g. "APT"' },
         limit: { type: 'number', description: 'Max cycles (default 20, max 50)' },
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
       },
       output: {
         schema: { type: 'string' },
@@ -885,14 +1158,23 @@ function registerLinearTools(ctx, config) {
       },
       async execute(args) {
         const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 20)), 50)
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
         const teamId = await resolveTeamId(key(), args.team)
+        const vars = { teamId }
+        if (after !== undefined) vars.after = after
+        const varDecl = after !== undefined ? 'query($teamId: String!, $after: String)' : 'query($teamId: String!)'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
         const data = await gql(key(), `
-          query($teamId: String!) {
-            cycles(first: ${limit}, filter: { team: { id: { eq: $teamId } } }) {
+          ${varDecl} {
+            cycles(first: ${limit}, filter: { team: { id: { eq: $teamId } } }${argList ? `, ${argList}` : ''}) {
               nodes { ${CYCLE_FIELDS} }
+              ${PAGE_INFO_FIELDS}
             }
           }
-        `, { teamId })
+        `, vars)
         const cycles = data.cycles.nodes.map((c) => ({
           id: c.id,
           number: c.number,
@@ -901,7 +1183,7 @@ function registerLinearTools(ctx, config) {
           endsAt: c.endsAt,
           completedAt: c.completedAt,
         }))
-        return JSON.stringify({ team: args.team, count: cycles.length, cycles }, null, 2)
+        return JSON.stringify({ team: args.team, count: cycles.length, cycles, pageInfo: normalizePageInfo(data.cycles.pageInfo) }, null, 2)
       },
     }),
   )
@@ -936,9 +1218,10 @@ function registerLinearTools(ctx, config) {
   register(
     defineTool({
       name: 'linear_user_list',
-      description: 'List users in the workspace. Returns up to `limit` users (default 20, max 50).',
+      description: 'List users in the workspace. Returns up to `limit` users (default 20, max 50). Cursor pagination: pass the previous page\'s pageInfo.endCursor as `after` to get the next page; the response includes pageInfo { hasNextPage, endCursor }.',
       parameters: {
         limit: { type: 'number', description: 'Max users (default 20, max 50)' },
+        after: { type: 'string', description: 'Cursor from a previous page (pageInfo.endCursor) to fetch the next page' },
       },
       output: {
         schema: { type: 'string' },
@@ -946,14 +1229,23 @@ function registerLinearTools(ctx, config) {
       },
       async execute(args) {
         const limit = Math.min(Math.max(1, Math.floor(args.limit ?? 20)), 50)
+        // Optional cursor. Kept as a variable (`$after`), never interpolated.
+        const after = typeof args.after === 'string' && args.after.trim() ? args.after : undefined
+        const vars = {}
+        if (after !== undefined) vars.after = after
+        const varDecl = after !== undefined ? 'query($after: String)' : 'query'
+        // One shared argument list: the cursor is declared only when it is also
+        // passed, so a call with no `after` sends exactly the pre-pagination document.
+        const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
         const data = await gql(key(), `
-          {
-            users(first: ${limit}) {
+          ${varDecl} {
+            users(first: ${limit}${argList ? `, ${argList}` : ''}) {
               nodes { ${USER_FIELDS} }
+              ${PAGE_INFO_FIELDS}
             }
           }
-        `)
-        return JSON.stringify({ count: data.users.nodes.length, users: data.users.nodes }, null, 2)
+        `, vars)
+        return JSON.stringify({ count: data.users.nodes.length, users: data.users.nodes, pageInfo: normalizePageInfo(data.users.pageInfo) }, null, 2)
       },
     }),
   )
@@ -1085,693 +1377,50 @@ function registerLinearTools(ctx, config) {
       },
     }),
   )
-}
 
-// ---------------------------------------------------------------------------
-// MCP bridge — parity with Linear's hosted MCP server
-// ---------------------------------------------------------------------------
-//
-// Linear's hosted MCP server (https://mcp.linear.app/mcp) speaks the official
-// Model Context Protocol over Streamable HTTP. This bridge:
-//   - connects with the installed @modelcontextprotocol/sdk Client +
-//     StreamableHTTPClientTransport (the same transport dsh-mcp-client uses),
-//   - authenticates with `Authorization: Bearer <token>` — Linear's hosted MCP
-//     endpoint expects the Bearer scheme, unlike the raw-value GraphQL header;
-//     the token is only ever placed in request headers, never in a tool name,
-//     description, schema, or log line,
-//   - DISCOVERS the server's tools at connect time with `tools/list` (paginated)
-//     and registers one harness tool per discovered MCP tool, so no Linear MCP
-//     API is hand-invented here,
-//   - forwards every call with `tools/call` using the RAW wire name (never the
-//     public name), mirroring dsh-mcp-client's naming contract:
-//       public name = `linear_mcp_<rawName>` when it fits the DeepSeek
-//       function-name contract (≤64 chars, [A-Za-z0-9_-]), otherwise a lossy
-//       normalization plus a 12-hex SHA-256 hash of the identity so distinct
-//       MCP identities never collapse onto one public name. Names are a pure
-//       function of the discovered raw name → stable across reconnects,
-//   - on `notifications/tools/list_changed` re-discovers and atomically swaps
-//     the registration generation (fetch fully first; only then dispose the old
-//     generation and register the new one),
-//   - on connection loss rebuilds the whole generation with bounded exponential
-//     backoff, and unregisters when reconnect is disabled or exhausted.
-//
-// The bridge is fail-soft: without an MCP token (LINEAR_MCP_TOKEN / config),
-// with no loadable MCP SDK, or in a minimal ctx that lacks `ctx.effect`, the
-// GraphQL suite still registers and the bridge simply stays off.
-
-const DEFAULT_MCP_URL = 'https://mcp.linear.app/mcp'
-const MCP_NAME_PREFIX = 'linear_mcp_'
-const MAX_PUBLIC_NAME_LENGTH = 64
-const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g
-const HASH_LENGTH = 12
-/** Defaults shared by the Reconnect schema and resolveReconnectPolicy. */
-const RECONNECT_DEFAULTS = Object.freeze({
-  enabled: true,
-  initialDelayMs: 500,
-  maxDelayMs: 30000,
-  maxAttempts: 10,
-})
-/** Default timeout for individual MCP tool calls (ms). */
-const DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS = 60000
-
-// Resolve the MCP SDK lazily but once, so a missing/unreachable SDK never
-// breaks the GraphQL tools that share this module.
-// The SDK (1.30.0, same copy dsh-mcp-client uses) has no RawCallToolResultSchema
-// export; mirror dsh-mcp-client's raw record schema — `z.record(z.string(),
-// z.unknown())` from the same zod the SDK resolves to — so the bridge owns
-// result validation instead of the SDK pre-validating a different contract.
-// DSH_LINEAR_MCP_SDK_ZOD overrides the zod URL for offline tests.
-let mcpSdkPromise
-function loadMcpSdk() {
-  mcpSdkPromise ??= (async () => {
-    const sdk = await import(resolveMcpSdkClientEntry())
-    const transport = await import(resolveMcpSdkTransportEntry())
-    const types = await import(resolveMcpSdkTypesEntry())
-    const zod = await import(resolveMcpSdkZodEntry())
-    return {
-      Client: sdk.Client,
-      StreamableHTTPClientTransport: transport.StreamableHTTPClientTransport,
-      ListToolsResultSchema: types.ListToolsResultSchema,
-      ToolListChangedNotificationSchema: types.ToolListChangedNotificationSchema,
-      // Same raw record schema dsh-mcp-client builds (zod v4 `z` namespace from 'zod/v4').
-      RawCallToolResultSchema: zod.z.record(zod.z.string(), zod.z.unknown()),
-    }
-  })()
-  return mcpSdkPromise
-}
-
-// Deterministic public name for one discovered MCP tool (see naming contract above).
-// The 64-char function-name limit is measured against the PUBLIC name. Two defects
-// this bridge's own tests caught:
-//   - the old `normalized === joined` guard threw away a perfectly valid readable
-//     name whenever normalization changed anything ("get.issues/v2" → hashed), and
-//   - the truncation was taken from the RAW name, silently dropping the
-//     linear_mcp_ namespace prefix that keeps these tools distinct from every
-//     other plugin's. Truncate the prefixed name instead.
-function publicToolName(rawName) {
-  const joined = `${MCP_NAME_PREFIX}${rawName}`
-  const normalized = joined.replace(INVALID_NAME_CHARS, '_')
-  if (normalized.length <= MAX_PUBLIC_NAME_LENGTH) return normalized
-  const hash = createHash('sha256').update(`linear\0${rawName}`).digest('hex').slice(0, HASH_LENGTH)
-  return `${normalized.slice(0, MAX_PUBLIC_NAME_LENGTH - HASH_LENGTH - 1)}_${hash}`
-}
-
-// Keep a supported advertised output schema; unsupported MCP vocabulary falls
-// back to unconstrained (annotation-only), exactly like dsh-mcp-client.
-function supportedOutputSchema(candidate) {
-  if (candidate === undefined) return undefined
-  try {
-    assertSupportedJsonSchema(candidate)
-    return candidate
-  } catch {
-    return undefined
-  }
-}
-
-// Canonical output contract for one proxied MCP tool.
-function createMcpOutput(rawName, structuredSchema) {
-  return {
-    schema: {
-      type: 'object',
-      properties: {
-        content: { type: 'array', items: {} },
-        structuredContent: structuredSchema ?? {},
+  // -- Direct GraphQL escape hatch -------------------------------------------
+  //
+  // The one tool that is not a hand-modelled endpoint: it forwards the caller's
+  // own GraphQL document to the SAME fixed endpoint (API_URL) with the SAME
+  // configured key, through the same gql() client and the same { error } guard
+  // every other tool runs under. There is no second endpoint, no extra config,
+  // and no credential of its own.
+  //
+  // Queries AND mutations are allowed — that is the point of the escape hatch —
+  // so what a call may actually do is bounded only by the permissions attached to
+  // the configured Linear API key, exactly as they are for every other tool here.
+  register(
+    defineTool({
+      name: 'linear_graphql',
+      description:
+        'Direct GraphQL escape hatch: send an arbitrary GraphQL document (query OR mutation) straight to the Linear API and get the raw `data` back as JSON. Use it for anything the named linear_* tools do not cover — coverage is whatever the Linear GraphQL API exposes to your key, so this is NOT a substitute for named-tool parity and nothing is projected or normalised. `query` is required and must be non-blank; `variables` is an optional object of GraphQL variable values (prefer variables over inlining values into the document). Both queries and mutations are sent as-is: what they may read or change is governed by your Linear API key permissions, so a mutation really writes.',
+      parameters: {
+        query: { type: 'string', required: true, description: 'The GraphQL document to execute (a query or a mutation)' },
+        // Explicit properties keep common variable shapes documented; openness
+        // stays true because the document decides which variables exist.
+        variables: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'Optional GraphQL variables object, keyed by variable name (e.g. { "id": "<uuid>" })',
+        },
       },
-      required: structuredSchema === undefined ? ['content'] : ['content', 'structuredContent'],
-      additionalProperties: false,
-    },
-    render(_args, value) {
-      return [{ type: 'text', text: extractText(value.content, rawName) }]
-    },
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Image-result projection (parity with @deepseek-ai/dsh-mcp-client's
-// prepareImageProjection / finalizeContent pair)
-//
-// An MCP result may carry `image` blocks holding raw base64. The harness model
-// vocabulary carries images as DURABLE attachment references, not inline bytes,
-// so the bridge: (1) returns the canonical raw value unchanged — programmatic
-// callers keep every byte; (2) prepares a projection that swaps each image for
-// its stored reference through the host's own admission pipeline
-// (`ctx.attachments.saveImages`, which owns the count / aggregate-byte /
-// media-type limits); and (3) hands the harness that content at the last mile
-// through `finalizeContent`. Any refusal — an invalid block, no mounted store,
-// a model route without image input, or an admission rejection — keeps the
-// existing text projection and only replaces the image with a diagnostic.
-// Text and error behaviour are unchanged either way.
-// ---------------------------------------------------------------------------
-
-/** Raster formats the durable attachment vocabulary supports. */
-const IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
-
-/** Canonical RFC 4648 base64, excluding whitespace and URL-safe aliases. */
-const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
-
-/** Narrow one JSON value to a string-keyed object (untrusted MCP content). */
-function isRecord(value) {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-/** Narrow a declared MIME string to the durable image vocabulary. */
-function isImageMediaType(value) {
-  return IMAGE_MEDIA_TYPES.includes(value)
-}
-
-/** Whether an untrusted MCP content array contains a declared image block. */
-function containsImage(content) {
-  return Array.isArray(content) && content.some((value) => isRecord(value) && value.type === 'image')
-}
-
-/** Decode one untrusted MCP image block without accepting base64 aliases. */
-function decodeImage(block) {
-  if (block.mimeType === undefined || !isImageMediaType(block.mimeType)) throw new Error('the declared media type is not PNG, JPEG, WebP, or GIF')
-  // `typeof` first: an untrusted block may carry a number or object where the
-  // spec declares a base64 string, and CANONICAL_BASE64.test() would coerce it.
-  if (typeof block.data !== 'string' || !CANONICAL_BASE64.test(block.data)) throw new Error('the image data is not canonical base64')
-  const data = Buffer.from(block.data, 'base64')
-  if (data.toString('base64') !== block.data) throw new Error('the image data is not canonical base64')
-  return { data, mediaType: block.mimeType }
-}
-
-/** Stable diagnostic text for an image block that was not admitted. */
-function imageDiagnostic(block, reason) {
-  return `[image unavailable: ${block?.mimeType ?? 'unknown media type'}; ${reason}; raw image data remains available to programmatic callers]`
-}
-
-/**
- * Recognize a caller-correctable image admission refusal from the mounted
- * attachment store WITHOUT importing @deepseek-ai/dsh-attachment: the plugin
- * resolves its peers by absolute file:// URL, and that package is not one of
- * them. Its AttachmentError class deliberately re-implements the HarnessError
- * shape so consumers route on `code`, never on the prototype chain — the same
- * rule that makes it cross duplicate package installations works across a
- * module boundary we do not own. Codes are copied from that package's
- * IMAGE_ADMISSION_ERROR_CODES (see THIRD_PARTY_NOTICES.md).
- */
-const IMAGE_ADMISSION_ERROR_CODES = new Set([
-  'TOO_MANY_IMAGES',
-  'IMAGES_TOO_LARGE',
-  'UNSUPPORTED_IMAGE_TYPE',
-  'INVALID_IMAGE_BASE64',
-  'INVALID_IMAGE',
-  'IMAGE_TYPE_MISMATCH',
-  'IMAGE_TOO_LARGE',
-  'IMAGE_TOO_MANY_PIXELS',
-  'IMAGE_DIMENSION_TOO_LARGE',
-])
-
-function isImageAdmissionError(error) {
-  return error instanceof Error && typeof error.code === 'string' && IMAGE_ADMISSION_ERROR_CODES.has(error.code)
-}
-
-/**
- * Prove that the route which will read this result accepts image input, then
- * hand back the durable store. Positive proof only: no mounted store, an
- * unresolvable route, or a model that does not declare image input all refuse.
- * @param ctx - plugin context carrying optional attachment and model services.
- * @param exec - exact tool execution whose agent supplies the latest route.
- * @returns the mounted attachment store.
- */
-async function resolveImageAdmission(ctx, exec) {
-  const attachments = typeof ctx?.get === 'function' ? ctx.get('attachments') : undefined
-  if (attachments === undefined) throw new Error('no attachment store is mounted')
-  const routed = exec.agent?.session?.requestHeader?.()?.config
-  const provider = routed?.provider ?? exec.agent?.options?.provider
-  const model = routed?.model ?? exec.agent?.options?.model
-  const llm = typeof ctx.get === 'function' ? ctx.get('llm') : undefined
-  if (provider === undefined || model === undefined || llm === undefined) throw new Error('the current model route could not be resolved')
-  let info
-  try {
-    info = await llm.resolveModelInfo(provider, model, exec.signal)
-  } catch {
-    throw new Error('the current model route could not be verified')
-  }
-  if (info?.inputModalities === undefined || !info.inputModalities.includes('image')) throw new Error(`model "${model}" does not declare image input`)
-  if (exec.signal?.aborted) throw new Error('the tool call was canceled before image storage')
-  return attachments
-}
-
-/**
- * Project ordered MCP blocks into the core content vocabulary. Text-like runs
- * are newline-coalesced; admitted images split those runs at their original
- * position. This is also what `extractText` runs through, so the text half of
- * the projection is exactly the pre-existing `extractText` string.
- */
-function projectContent(mcpContent, toolName, image = (block) => ({ type: 'text', text: imageDiagnostic(block, 'this result was not admitted to durable model context') })) {
-  const projected = []
-  const text = []
-  const flushText = () => {
-    if (text.length === 0) return
-    projected.push({ type: 'text', text: text.splice(0).join('\n') })
-  }
-  for (const [index, value] of (Array.isArray(mcpContent) ? mcpContent : []).entries()) {
-    if (!isRecord(value)) {
-      text.push('[unsupported MCP content block: expected an object]')
-      continue
-    }
-    switch (value.type) {
-      case 'text':
-        if (value.text !== undefined) text.push(value.text)
-        break
-      case 'image':
-        flushText()
-        projected.push(image(value, index))
-        break
-      case 'resource_link':
-        if (value.name === undefined || value.uri === undefined) text.push('[resource link unavailable: the MCP block is missing its name or URI]')
-        else text.push(`Resource link: ${value.name} (${value.uri})`)
-        break
-      case 'audio':
-        text.push(`[audio result unsupported: ${value.mimeType ?? 'unknown media type'}]`)
-        break
-      case 'resource':
-        text.push('[embedded resource unsupported; raw resource data remains available to programmatic callers]')
-        break
-      default:
-        text.push(`[unsupported MCP content type: ${value.type}]`)
-    }
-  }
-  flushText()
-  return projected.length > 0 ? projected : [{ type: 'text', text: `(${toolName} returned no model-visible content)` }]
-}
-
-// Extract text from an MCP content array into one string (network trust
-// boundary: spec-required fields are guarded with fallbacks).
-function extractText(mcpContent, toolName) {
-  return projectContent(mcpContent, toolName).map((block) => block.text).join('\n')
-}
-
-/**
- * Decode, preflight, and durably save one MCP result's ordered image batch.
- * Any refusal projects every image as text while retaining the canonical raw
- * value for programmatic callers.
- */
-async function prepareImageProjection(ctx, exec, content, toolName) {
-  const decoded = []
-  const validationErrors = new Map()
-  const imageIndexes = []
-  for (const [index, value] of content.entries()) {
-    if (!isRecord(value) || value.type !== 'image') continue
-    imageIndexes.push(index)
-    try {
-      decoded.push(decodeImage(value))
-    } catch (error) {
-      validationErrors.set(index, error.message)
-    }
-  }
-  if (validationErrors.size > 0) {
-    return projectContent(content, toolName, (block, index) => ({
-      type: 'text',
-      text: imageDiagnostic(block, validationErrors.get(index) ?? 'another image in the same result was invalid'),
-    }))
-  }
-  let attachments
-  try {
-    attachments = await resolveImageAdmission(ctx, exec)
-  } catch (error) {
-    const reason = error?.message ?? String(error)
-    return projectContent(content, toolName, (block) => ({ type: 'text', text: imageDiagnostic(block, reason) }))
-  }
-  try {
-    const refs = await attachments.saveImages(decoded)
-    const byIndex = new Map(imageIndexes.map((index, offset) => [index, refs[offset]]))
-    return projectContent(content, toolName, (_block, index) => ({ type: 'image', attachment: byIndex.get(index) }))
-  } catch (error) {
-    const reason = isImageAdmissionError(error) ? `image admission rejected the result: ${error.message}` : 'durable image storage rejected the result'
-    return projectContent(content, toolName, (block) => ({ type: 'text', text: imageDiagnostic(block, reason) }))
-  }
-}
-
-/**
- * The model-facing half of one MCP result — this bridge's `finalizeContent`.
- * It follows the upstream dsh-mcp-client shape exactly: the projection is
- * prepared in `execute` (the only async stage of the pipeline), keyed in a
- * module-local WeakMap on the exact `exec` object, and read back by the
- * synchronous finalizer the registry snapshots from the REGISTERED definition
- * at call start. Upstream's per-execution guards are preserved verbatim: an
- * error outcome is never rewritten, and a projection is applied only when the
- * outcome still carries what execute returned — `result.value` deep-equals the
- * recorded canonical value AND `result.content` deep-equals the recorded
- * rendered fallback. A result another wrapper rewrote or replaced keeps its own
- * content (returning undefined preserves it). Each projection is consumed on the
- * first read, exactly like upstream's `projections.delete(exec)`.
- *   - image bytes always stay in the canonical `value` for programmatic
- *     callers; only the model-visible content carries durable references;
- *   - every refusal leaves the pre-existing text projection in place.
- * The callback is total: it never throws, and returns undefined to preserve.
- */
-
-/** Prepared projection plus the two recorded values upstream compares against. */
-const imageProjections = new WeakMap()
-
-function projectMcpResultContent(exec, result) {
-  try {
-    const prepared = imageProjections.get(exec)
-    if (prepared === undefined) return undefined
-    // One projection per execution: read it once and release the key, so a
-    // replayed finalizer for an already-settled call can never re-apply it. The
-    // WeakMap entry is inert after that anyway — its identity is the exec object
-    // the registry hands this callback, so nothing else can look it up.
-    imageProjections.delete(exec)
-    // Upstream's error guard: an outcome the registry turned into an error — a
-    // throw, or a cancellation it replaced this value with — is left alone.
-    if (result?.isError === true) return undefined
-    // Upstream's per-exec guard: the outcome still carries what execute returned.
-    if (!isDeepStrictEqual(result.value, prepared.value)) return undefined
-    if (!isDeepStrictEqual(result.content, prepared.fallback)) return undefined
-    return prepared.projected
-  } catch {
-    return undefined
-  }
-}
-
-// Credential-leak guard for diagnostics: strip anything that looks like a
-// bearer/API token before an error message reaches a log line or the model.
-// The li_ shape must match the WHOLE token run: Linear keys are
-// "li_api_<base64-ish body>" with '_' inside the body, so the old \b-anchored
-// /\bli_[A-Za-z0-9]+\b/ stopped at the first inner underscore and leaked the
-// entire secret body past the guard.
-const TOKEN_SHAPES = [/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, /\bli_[A-Za-z0-9_]+/g, /\bsk-[A-Za-z0-9]+/g]
-function redactSecrets(text) {
-  let out = String(text)
-  for (const re of TOKEN_SHAPES) out = out.replace(re, '[redacted]')
-  return out
-}
-
-/**
- * Validate raw reconnect config and apply defaults. Re-judges every bound
- * because programmatic construction may bypass Schemastery normalization.
- */
-function resolveReconnectPolicy(config, path) {
-  if (config !== undefined) {
-    for (const key of Object.keys(config)) {
-      if (!Object.hasOwn(RECONNECT_DEFAULTS, key)) throw new Error(`${path}.${key} is not a reconnect option`)
-    }
-  }
-  const enabled = config?.enabled ?? RECONNECT_DEFAULTS.enabled
-  const initialDelayMs = config?.initialDelayMs ?? RECONNECT_DEFAULTS.initialDelayMs
-  const maxDelayMs = config?.maxDelayMs ?? RECONNECT_DEFAULTS.maxDelayMs
-  const maxAttempts = config?.maxAttempts ?? RECONNECT_DEFAULTS.maxAttempts
-  if (!Number.isFinite(initialDelayMs) || initialDelayMs <= 0) throw new Error(`${path}.initialDelayMs must be a positive finite number`)
-  if (!Number.isFinite(maxDelayMs) || maxDelayMs <= 0) throw new Error(`${path}.maxDelayMs must be a positive finite number`)
-  if (initialDelayMs > maxDelayMs) throw new Error(`${path}.initialDelayMs must be less than or equal to maxDelayMs`)
-  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) throw new Error(`${path}.maxAttempts must be a positive integer`)
-  return Object.freeze({ enabled, initialDelayMs, maxDelayMs, maxAttempts })
-}
-
-/**
- * One supervised MCP connection: connect → discover → register; re-discover on
- * list_changed; rebuild the generation on connection loss with bounded backoff.
- *
- * Registration lifecycle fit (verified against cordis 4.0.2): a plugin `apply`
- * may be async — the fiber awaits it (`_execute`/`_reload`) and collects effect
- * disposers registered during it — so discovery at apply time is compatible.
- * Later re-syncs run OUTSIDE apply: every registration is owned by an explicit
- * `ctx.effect()` whose disposer unregisters that generation's tools, and the
- * reconnect timer is `unref()`ed so a pending retry never keeps the process alive.
- */
-function startMcpConnection(ctx, config) {
-  const label = 'linear-mcp'
-  const policy = resolveReconnectPolicy(config.reconnect, 'linear mcp: reconnect')
-  const toolCallTimeoutMs = config.toolCallTimeoutMs ?? DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS
-
-  let disposed = false
-  /** The live generation's Client (undefined while down/backing off). */
-  let client
-  /** Live registrations owned by the current generation. */
-  let disposers = new Map()
-  let reconnectTimer
-  /** Consecutive failed connection attempts within the current outage. */
-  let failedAttempts = 0
-  /** When the current generation finished connect + initial discovery. */
-  let connectedAt
-  /** The real error from the first attempt, for apply-time diagnostics. */
-  let firstAttemptError
-  /** Serializes every discovery swap so two can never interleave. */
-  let syncChain = Promise.resolve()
-
-  const isCurrent = (generation) => !disposed && client === generation
-
-  // One effect slot owns ALL registrations of the current generation. It is
-  // armed exactly once, during apply (so it belongs to the plugin fiber), and
-  // always unregisters whatever is live at teardown — never a stale set.
-  // (Cordis `_execute` rejects a *returned* function as "Invalid effect", so
-  // the disposer is collected by returning an iterable of disposers.)
-  ctx.effect(() => [
-    () => {
-      for (const dispose of disposers.values()) dispose()
-      disposers = new Map()
-    },
-  ], 'linear.mcp.tools')
-
-  /** Fetch the complete next generation, then atomically swap registrations. */
-  async function syncTools(generation) {
-    const sdk = await loadMcpSdk()
-    const definitions = new Map()
-    const seenCursors = new Set()
-    let cursor
-    do {
-      // Uncached paginated tools/list (same idiom as dsh-mcp-client): a raw
-      // request keeps the SDK's per-page schema cache from merging pages.
-      const response = await generation.request(
-        { method: 'tools/list', ...(cursor === undefined ? {} : { params: { cursor } }) },
-        sdk.ListToolsResultSchema,
-      )
-      for (const tool of response.tools) {
-        const publicName = publicToolName(tool.name)
-        if (definitions.has(publicName)) {
-          throw new Error(`${label}: server listed tool "${tool.name}" more than once — invalid tool list`)
+      output: {
+        schema: { type: 'string' },
+        render: (_a, v) => [{ type: 'text', text: v }],
+      },
+      async execute(args) {
+        // The parameter schema enforces the string; this is the non-blank half of
+        // "required nonblank", checked before anything reaches the network.
+        if (typeof args.query !== 'string' || !args.query.trim()) {
+          return JSON.stringify({ error: '"query" must be a non-empty GraphQL document' })
         }
-        definitions.set(publicName, createMcpDefinition(ctx, generation, sdk, publicName, tool, config))
-      }
-      cursor = response.nextCursor
-      if (cursor) {
-        if (seenCursors.has(cursor)) throw new Error(`${label}: server repeated a tools/list continuation cursor — invalid tool list`)
-        seenCursors.add(cursor)
-      }
-    } while (cursor)
-    // Fetch phase succeeded — only now swap: dispose the old generation, then
-    // register the new one. A registration conflict rolls the partial back.
-    for (const dispose of disposers.values()) dispose()
-    const next = new Map()
-    try {
-      for (const [publicName, definition] of definitions) next.set(publicName, ctx.tools.register(definition))
-    } catch (error) {
-      for (const dispose of next.values()) dispose()
-      disposers = new Map()
-      ctx.logger.error(`${label}: tool registration failed, no tools registered: ${String(error)}`)
-      throw error
-    }
-    disposers = next
-    return next.size
-  }
-
-  function enqueueSync(generation) {
-    const run = syncChain.then(async () => {
-      if (!isCurrent(generation)) return
-      await syncTools(generation)
-    })
-    syncChain = run.catch(() => {})
-    return run
-  }
-
-  /** One disconnect decision per generation (idempotent under racing close/error). */
-  function generationDown(generation) {
-    if (!isCurrent(generation)) return
-    client = undefined
-    scheduleReconnect()
-  }
-
-  function scheduleReconnect() {
-    const lostEstablishedConnection = connectedAt !== undefined
-    if (!policy.enabled) {
-      ctx.logger.error(`${label}: ${lostEstablishedConnection ? 'connection lost and reconnect is disabled' : 'connection failed and reconnect is disabled'} — Linear MCP tools are unavailable until the plugin reloads or the Host restarts`)
-      return
-    }
-    // A connection that stayed up past maxDelayMs closes the outage, so a
-    // crash-loop still exhausts the cap instead of restarting forever.
-    if (connectedAt !== undefined && Date.now() - connectedAt >= policy.maxDelayMs) failedAttempts = 0
-    connectedAt = undefined
-    failedAttempts += 1
-    if (failedAttempts > policy.maxAttempts) {
-      syncChain = syncChain.then(() => {
-        for (const dispose of disposers.values()) dispose()
-        disposers = new Map()
-      })
-      ctx.logger.error(`${label}: giving up after ${policy.maxAttempts} consecutive failed reconnect attempts — Linear MCP tools unregistered; reload the plugin or restart the Host to reconnect`)
-      return
-    }
-    const delayMs = Math.min(policy.maxDelayMs, policy.initialDelayMs * 2 ** (failedAttempts - 1))
-    ctx.logger.warn(`${label}: ${lostEstablishedConnection ? 'connection lost; reconnecting' : 'connection failed; retrying'} in ${delayMs}ms (attempt ${failedAttempts}/${policy.maxAttempts})`)
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = undefined
-      connectGeneration(false)
-    }, delayMs)
-    reconnectTimer.unref()
-  }
-
-  /** One connection attempt. Never rejects; every failure funnels through generationDown. */
-  async function connectGeneration(startup) {
-    let sdk
-    try {
-      sdk = await loadMcpSdk()
-    } catch (error) {
-      if (firstAttemptError === undefined) firstAttemptError = error
-      ctx.logger.error(`${label}: the MCP SDK could not be loaded — Linear MCP tools are unavailable: ${String(error)}`)
-      return
-    }
-    const generation = new sdk.Client({ name: 'dsh-linear-mcp-bridge', version: '0.1.0' }, { capabilities: {} })
-    client = generation
-    // A close observed DURING the attempt is handled by the attempt's own
-    // settle path; only a post-settle close triggers the reconnect decision.
-    let attemptSettled = false
-    generation.onclose = () => {
-      if (attemptSettled && isCurrent(generation)) generationDown(generation)
-    }
-    generation.onerror = (error) => {
-      // Transport-level errors are logged; a dead transport also fires onclose.
-      ctx.logger.warn(`${label}: transport error: ${redactSecrets(error?.message ?? error)}`)
-    }
-    generation.setNotificationHandler(sdk.ToolListChangedNotificationSchema, async () => {
-      if (!isCurrent(generation)) return
-      ctx.logger.info(`${label}: tool list changed, re-syncing`)
-      try {
-        await enqueueSync(generation)
-      } catch (error) {
-        if (!disposed) ctx.logger.error(`${label}: tool re-sync failed: ${String(error)}`)
-      }
-    })
-    // Credentials live ONLY in this header map, rebuilt per generation.
-    const headers = { Authorization: `Bearer ${config.token}` }
-    try {
-      await generation.connect(new sdk.StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers } }))
-      if (generation.transport === undefined) {
-        // The transport closed itself during connect(): settle the attempt and
-        // let the reconnect scheduler take over.
-        attemptSettled = true
-        if (isCurrent(generation)) generationDown(generation)
-        return
-      }
-      if (startup) {
-        // Startup registration failure is fatal to apply so the operator sees it.
-        const count = await syncTools(generation)
-        ctx.logger.info(`${label}: connected to ${config.url}, registered ${count} Linear MCP tools`)
-      } else {
-        await enqueueSync(generation)
-        if (failedAttempts > 0) ctx.logger.info(`${label}: reconnected and re-synced tools (attempt ${failedAttempts}/${policy.maxAttempts})`)
-      }
-    } catch (error) {
-      if (firstAttemptError === undefined) firstAttemptError = error
-      if (isCurrent(generation)) ctx.logger.warn(`${label}: connection attempt failed: ${authHint(error)}`)
-      try {
-        await generation.close()
-      } catch {}
-      attemptSettled = true
-      if (!isCurrent(generation)) return
-      generationDown(generation)
-      return
-    }
-    attemptSettled = true
-    if (!isCurrent(generation)) return
-    connectedAt = Date.now()
-  }
-
-  // Surface an actionable hint for auth failures without echoing any secret.
-  function authHint(error) {
-    const text = String(error?.message ?? error)
-    if (/401|Unauthorized/i.test(text)) return `${text} — check that the Linear MCP token (LINEAR_MCP_TOKEN / config mcp.token) is valid for ${config.url}`
-    return text
-  }
-
-  const settling = connectGeneration(true)
-  ctx.effect(() => [
-    () => {
-      disposed = true
-      if (reconnectTimer !== undefined) {
-        clearTimeout(reconnectTimer)
-        reconnectTimer = undefined
-      }
-      const current = client
-      client = undefined
-      return async () => {
-        if (current !== undefined) {
-          try {
-            await current.close()
-          } catch {}
-        }
-        await settling
-        await syncChain
-        for (const dispose of disposers.values()) dispose()
-        disposers = new Map()
-      }
-    },
-  ], 'linear.mcp.connection')
-
-  return {
-    /** Settles after the startup attempt; carries its error without throwing. */
-    ready: settling.then(() => firstAttemptError),
-  }
-}
-
-/** Build one harness tool definition for a discovered MCP tool. */
-function createMcpDefinition(ctx, client, sdk, publicName, tool, config) {
-  const rawName = tool.name
-  return {
-    name: publicName,
-    description: tool.description ?? '',
-    // Pass the DISCOVERED input schema straight through; this plugin never
-    // hand-models Linear's MCP API surface.
-    parameters: tool.inputSchema ?? {},
-    output: createMcpOutput(rawName, supportedOutputSchema(tool.outputSchema)),
-    timeoutMs: config.toolCallTimeoutMs ?? DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS,
-    // Last-mile model-facing projection for image-bearing results (see
-    // projectMcpResultContent). Declared on the definition so the registry
-    // snapshots it per execution; the value it never touches stays canonical.
-    finalizeContent(exec, result) {
-      return projectMcpResultContent(exec, result)
-    },
-    async execute(args, exec) {
-      const result = await client.request(
-        { method: 'tools/call', params: { name: rawName, arguments: typeof args === 'object' && args !== null ? args : {} } },
-        // Raw record schema (same as dsh-mcp-client): the bridge owns result
-        // validation instead of the SDK pre-validating a different contract.
-        sdk.RawCallToolResultSchema ?? { parse: (v) => v },
-        { signal: exec.signal, timeout: config.toolCallTimeoutMs ?? DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS },
-      )
-      if (result.isError === true) throw new Error(redactSecrets(extractText(result.content, rawName)))
-      const content = Array.isArray(result.content) ? result.content : []
-      // Awaited HERE — the only async stage of the pipeline. finalizeContent is
-      // synchronous, so a projection started there could never land: an
-      // image-bearing result must be projected before this body returns.
-      if (containsImage(content)) {
-        const projected = await prepareImageProjection(ctx, exec, content, rawName)
-        // Keyed on the exact execution the registry snapshots its finalizer for.
-        // The two recorded values are what the finalizer compares the outcome
-        // against: this body's canonical value, and the model-visible fallback —
-        // `render` is createMcpOutput's text-only projection of that same value,
-        // so its snapshot equals this one block array. A structuredContent field
-        // rides alongside `content` in the value but never in the rendered
-        // content, so it is recorded on the value half only.
-        // The recorded value must be EXACTLY what this body returns below —
-        // the finalizer deep-equals `result.value` against it, so a recorded
-        // `{ content }` never matches an outcome that carries structuredContent
-        // alongside it, and the projection would be silently dropped (the model
-        // would see the text diagnostic while the raw bytes stayed canonical).
-        const value = {
-          content,
-          ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
-        }
-        imageProjections.set(exec, { projected, value, fallback: [{ type: 'text', text: extractText(content, rawName) }] })
-        return value
-      }
-      return {
-        content,
-        ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
-      }
-    },
-  }
+        const data = await gql(key(), args.query, args.variables)
+        // Raw pass-through: the document chooses the shape, so the result is
+        // returned as-is rather than projected through a fixed field set.
+        return JSON.stringify({ data }, null, 2)
+      },
+    }),
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -1782,108 +1431,30 @@ function createMcpDefinition(ctx, client, sdk, publicName, tool, config) {
  * Plugin config:
  *   apiKey: Linear personal API key (li_api_...) for the GraphQL tools.
  *           Falls back to the LINEAR_API_KEY environment variable when unset.
- *   mcp:    optional MCP-bridge config (Linear hosted MCP server parity):
- *             token  — bearer token; falls back to LINEAR_MCP_TOKEN, then to
- *                      the same key resolution as `apiKey` (config apiKey or
- *                      LINEAR_API_KEY). The value is used ONLY in the
- *                      Authorization header of requests to `url`.
- *             url    — Streamable HTTP endpoint (default https://mcp.linear.app/mcp).
- *             toolCallTimeoutMs / reconnect — call timeout and bounded backoff.
  *
- * The getter above mirrors resolveKey's precedence: a config.apiKey passed in the
- * patch row wins over the env var. The getter itself has no access to the
- * config object (it's a module-level singleton), so it only reports the env
- * var; the authoritative resolution happens in resolveKey which checks
- * `config?.apiKey` first.
+ * There is no other config. The plugin has no MCP side: it neither hosts an
+ * MCP server nor connects to one, and it reads no MCP-related setting or
+ * environment variable.
  */
-// Cordis 0.1.5 validates a plugin's `Config` as a Standard Schema (it calls
+// Cordis validates a plugin's `Config` as a Standard Schema (it calls
 // Config["~standard"].validate(...)). The real API key still comes from the
 // LINEAR_API_KEY env var (see resolveKey); this schema only needs to accept an
 // optional `apiKey` string so a patch row may also supply one. `.default('')`
 // makes a missing field valid; the empty value is ignored by resolveKey, which
 // prefers config.apiKey only when it is non-empty and otherwise falls back to env.
-const Reconnect = z.object({
-  enabled: z.boolean().default(RECONNECT_DEFAULTS.enabled),
-  initialDelayMs: z.number().min(1).max(2147483647).default(RECONNECT_DEFAULTS.initialDelayMs),
-  maxDelayMs: z.number().min(1).max(2147483647).default(RECONNECT_DEFAULTS.maxDelayMs),
-  maxAttempts: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(RECONNECT_DEFAULTS.maxAttempts),
-})
-
-const McpConfig = z.object({
-  token: z.string().default(''),
-  url: z.string().default(DEFAULT_MCP_URL),
-  toolCallTimeoutMs: z.number().min(1).default(DEFAULT_MCP_TOOL_CALL_TIMEOUT_MS),
-  reconnect: Reconnect,
-})
-
 const Config = z.object({
   apiKey: z.string().default(''),
-  mcp: McpConfig,
 })
 
-/**
- * Resolve the MCP bearer token without ever printing it. Precedence:
- * config.mcp.token → LINEAR_MCP_TOKEN → the GraphQL key resolution chain.
- */
-function resolveMcpToken(config) {
-  const token = config?.mcp?.token || process.env.LINEAR_MCP_TOKEN || config?.apiKey || process.env.LINEAR_API_KEY
-  if (!token) throw new Error('Linear MCP token not configured: set the LINEAR_MCP_TOKEN environment variable (or pass `mcp.token` / `apiKey` in plugin config).')
-  return token
-}
-
-// The bridge is opt-in and fail-soft: a missing token or an unreachable MCP
-// server must never take down the GraphQL tool suite that shares this plugin.
-// LINEAR_MCP_DISABLED=1 turns it off; otherwise it starts only when an MCP
-// token is configured AND the host ctx supports effect-scoped teardown
-// (ctx.effect) — a bare test ctx without lifecycle support keeps the bridge off.
-const MCP_BRIDGE_ENABLED = process.env.LINEAR_MCP_DISABLED !== '1'
-
-async function apply(ctx, config) {
+function apply(ctx, config) {
   registerLinearTools(ctx, config)
-  if (!MCP_BRIDGE_ENABLED || typeof ctx.effect !== 'function') return
-  let mcpConfig
-  try {
-    mcpConfig = {
-      token: resolveMcpToken(config),
-      url: config?.mcp?.url || DEFAULT_MCP_URL,
-      toolCallTimeoutMs: config?.mcp?.toolCallTimeoutMs,
-      reconnect: config?.mcp?.reconnect,
-    }
-  } catch (err) {
-    ctx.logger.warn(`linear-mcp: bridge disabled — ${err?.message ?? err}`)
-    return
-  }
-  const connection = startMcpConnection(ctx, mcpConfig)
-  // Startup attempt settles inside apply (cordis awaits an async apply), so a
-  // failure here is reported once, clearly, and does not throw the fiber down.
-  await connection.ready
 }
 
-// The MCP-bridge internals are exported alongside the plugin surface so the
-// mock-based bridge tests (test-mcp-bridge.js) can exercise discovery, naming,
-// auth, forwarding and disposal in isolation. Cordis's namespace unwrap keys off
-// { name, inject, apply }, so extra named exports are inert for the loader.
+// Cordis's namespace unwrap keys off { name, inject, apply }; this module
+// exports exactly that plugin surface and nothing else.
 export {
   Config,
   apply,
   inject,
   name,
-  // MCP bridge internals (test-visible; no behaviour change)
-  createMcpDefinition,
-  createMcpOutput,
-  extractText,
-  publicToolName,
-  redactSecrets,
-  resolveMcpToken,
-  resolveReconnectPolicy,
-  startMcpConnection,
-  supportedOutputSchema,
-  // Image-result projection internals (test-visible)
-  decodeImage,
-  containsImage,
-  imageDiagnostic,
-  isImageAdmissionError,
-  prepareImageProjection,
-  projectContent,
-  projectMcpResultContent,
 }

@@ -1,6 +1,6 @@
 // test-loader.mjs — offline smoke test: load @kb1slnlabs/dsh-linear through the
 // Cordis plugin loader against the scratch profile, and assert the entry started
-// with a fiber and wired 20 tools into the real host ToolRuntime, and that those
+// with a fiber and wired 26 tools into the real host ToolRuntime, and that those
 // names are gone after the plugin fiber is disposed. No keys, no network.
 //
 // Run: DSH_ROOT=<dsh install dir> LINEAR_TEST_PROFILE=<profile dir> node test-loader.mjs
@@ -57,7 +57,11 @@ const EXPECTED_TOOL_NAMES = [
   'linear_issue_get',
   'linear_issue_create',
   'linear_issue_update',
+  'linear_issue_archive',
+  'linear_issue_unarchive',
   'linear_comment_add',
+  'linear_comment_update',
+  'linear_comment_delete',
   'linear_comment_list',
   'linear_relation_add',
   'linear_team_list',
@@ -65,6 +69,7 @@ const EXPECTED_TOOL_NAMES = [
   'linear_label_list',
   'linear_project_list',
   'linear_project_create',
+  'linear_project_update',
   'linear_label_create',
   'linear_cycle_list',
   'linear_cycle_get',
@@ -73,6 +78,7 @@ const EXPECTED_TOOL_NAMES = [
   'linear_project_get',
   'linear_label_get',
   'linear_team_get',
+  'linear_graphql',
 ];
 
 // Keep the plugin offline: no live key can be picked up from the environment.
@@ -111,7 +117,7 @@ const entry = ctx.loader.resolve('linear');
 if (!entry) throw new Error('loader entry "linear" not found');
 if (!entry.fiber) throw new Error('loader entry "linear" has no fiber');
 
-// Before disposal: the real ToolRuntime must know exactly the 20 linear tools.
+// Before disposal: the real ToolRuntime must know exactly the 26 linear tools.
 const wired = tools.wireSchemas({});
 const registered = wired.knownNames.slice();
 const missing = EXPECTED_TOOL_NAMES.filter((name) => !registered.includes(name));
@@ -132,8 +138,8 @@ if (wired.schemas == null || typeof wired.schemas !== 'object') {
   console.error('FAIL: wireSchemas({}) did not return a schemas object');
   failed = true;
 }
-if (registered.length !== 20) {
-  console.error(`FAIL: expected 20 knownNames before disposal, got ${registered.length}`);
+if (registered.length !== 26) {
+  console.error(`FAIL: expected 26 knownNames before disposal, got ${registered.length}`);
   failed = true;
 }
 if (missing.length) {
@@ -159,4 +165,4 @@ if (remaining.length) {
 await ctx.fiber.dispose();
 
 if (failed) process.exitCode = 1;
-else console.log('PASS: loader entry has a fiber, 20 tool names wired before disposal and none after');
+else console.log('PASS: loader entry has a fiber, 26 tool names wired before disposal and none after');
