@@ -23,13 +23,13 @@ entire surface; nothing else is registered under any condition.
 > bounded by Linear's own API and by your key's permissions, so it extends
 > coverage, it does not guarantee parity. See [Limitations](#limitations).
 
-> Status: this is **version 0.2.0** of the standalone implementation — the
+> Status: this is **version 0.2.1** of the standalone implementation — the
 > GitHub release for it is
-> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.0](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.0),
+> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1),
 > and the package is published on npm as `@kb1slnlabs/dsh-linear`. The earlier
 > **0.1.0** release, also on the public GitHub repository `KB1SLN-Labs/dsh-linear`
 > and on npm, shipped with an MCP bridge to Linear's hosted MCP server; that
-> bridge is gone from 0.2.0 (see **There is no MCP in this package — at all.**
+> bridge is gone from 0.2.x (see **There is no MCP in this package — at all.**
 > above and [Limitations](#limitations)), so do not treat 0.1.0 as this package.
 > The offline suite described under
 > [Testing](#testing) is mock-tested (loopback only), except
@@ -158,8 +158,8 @@ Override env vars used to pin dependency resolution (mainly for offline tests):
 
 ## Install
 
-This is **version 0.2.0** of the standalone implementation; its release is
-[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.0](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.0),
+This is **version 0.2.1** of the standalone implementation; its release is
+[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1),
 and the tarball attached to that release — `kb1slnlabs-dsh-linear.tgz` — is the
 pinned artifact for route 4 below. Four install routes:
 
@@ -176,9 +176,9 @@ dsh plugin --profile web add github:KB1SLN-Labs/dsh-linear
 # 3. from npm, by package name (latest published version)
 dsh plugin --profile web add @kb1slnlabs/dsh-linear
 
-# 4. version-pinned release asset — download the tarball attached to the v0.2.0
+# 4. version-pinned release asset — download the tarball attached to the v0.2.1
 #    GitHub release, then install it from disk:
-#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.0/kb1slnlabs-dsh-linear.tgz
+#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.1/kb1slnlabs-dsh-linear.tgz
 dsh plugin --profile web add file:./kb1slnlabs-dsh-linear.tgz
 ```
 
@@ -187,10 +187,10 @@ picks up edits in place. Use an **absolute** path — that is what this repo's o
 used, and it is what makes the spec unambiguous regardless of where `dsh plugin` runs
 from. Routes 2–4 install a copy instead, so later source edits do not leak into the
 profile. Only route 4 pins an exact version: `kb1slnlabs-dsh-linear.tgz` is the fixed
-release-asset name for the v0.2.0 GitHub release — renamed from the output of
+release-asset name for the v0.2.1 GitHub release — renamed from the output of
 `npm pack`, not the filename npm itself generates. Route 2 follows the repository's
 default branch and route 3 follows npm's `latest`, so neither is guaranteed to install
-0.2.0 once newer work or releases exist; use route 4 when reproducibility matters.
+0.2.1 once newer work or releases exist; use route 4 when reproducibility matters.
 
 The clean scratch profile behind the verification described under
 [Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
@@ -209,10 +209,21 @@ first, then from an anchor derived portably from `process.execPath` (the npm/pnp
 prefix), then `%APPDATA%/npm/node_modules` on Windows or `/usr/local/lib/node_modules` /
 `/usr/lib/node_modules` on POSIX.
 
-The `@deepseek-ai/dsh-tools` this package pins (`0.1.5-rc.2`) was verified against host
-**0.2.1-rc.3**. In a base-only scratch profile it can log **missing-peer warnings** —
-that is expected: the host supplies those services, and the pinned copy exists so the
-plugin resolves its own peer at all. Do not read such a warning as a failure.
+The `@deepseek-ai/dsh-tools` this package pins as a direct dependency (`0.2.1-rc.3`) is
+the copy that was verified against **DSH Desktop 0.2.1-rc.3**. A **bare base-only
+profile can fail to load** the plugin: the pinned `@deepseek-ai/dsh-tools` needs host
+peers such as `@deepseek-ai/dsh-sandbox`, which a base-only profile does not provide —
+this is a load failure, not a warning you can ignore. Use a **full web or Desktop
+profile** instead.
+
+The `@deepseek-ai/dsh-tools` peer requirement in `package.json` is
+`^0.2.1-rc.3`. That matches the direct dependency and names the host this plugin has
+actually been verified against — **DSH Desktop 0.2.1-rc.3**, the loader run described
+under [Testing](#testing). Earlier manifests declared `^0.1.1-rc.2`, and for a while an
+OR range (`^0.1.1-rc.2 || ^0.2.1-rc.3`); both are gone in 0.2.1, because the 0.1 series is
+not a host this release targets. `test.js` does **not** check this range — it checks the
+module surface and the tools (see [Testing](#testing)) — so keep the manifest and the
+lockfile consistent by hand.
 
 ## Testing
 
@@ -315,12 +326,12 @@ profile.
   runtime 0.2.1-rc.3** with the Cordis loader plus `ToolRuntime` — a bare host context,
   **not** a full desktop app boot: no LLM turn, session log, sandbox, or app entry tree
   was started.
-- **Verified (CLI install smoke, separate from the line above):** a clean scratch
-  profile based on the **shipped headless template** took the **packed** plugin through
-  `dsh plugin`, and `dsh --profile <scratch> --help` exited **0** on **Windows CLI
-  0.1.5-rc.2**. That is an install-and-launch smoke check only: no model turn and no
-  full desktop GUI boot were performed, and it says nothing about the loader/`ToolRuntime`
-  run above, which was on desktop runtime 0.2.1-rc.3.
+- **Verified (CLI install smoke, separate from the line above):** the **0.2.1 final
+  tarball** (`kb1slnlabs-dsh-linear.tgz`, route 4) was installed into a clean scratch
+  profile based on the **shipped web template**, and the real Cordis loader test
+  (`test-loader.mjs`) run against that profile registered **26 tools** on **DSH runtime
+  0.2.1-rc.3**. That is an install-and-load check only: no model turn and no full desktop
+  GUI boot were performed, and **no live desktop conversation was tested**.
 - **Verified against live services:** the Linear GraphQL introspection guard in `test.js`
   has run with a real key and passed — the schema fields this plugin emits, including the
   five direct-write mutations, their arguments, and their payload shapes (`ProjectPayload`,
