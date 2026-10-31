@@ -7,7 +7,8 @@
 // One tool surface:
 //   GraphQL tools (linear_*): 26 hand-written tools that talk to the Linear
 //   GraphQL API (https://api.linear.app/graphql) with a personal API token
-//   (env LINEAR_API_KEY or config apiKey). There is no MCP server and no MCP
+//   (env LINEAR_API_KEY, config apiKey, or the key file ~/.config/linear/api-key).
+//   There is no MCP server and no MCP
 //   client here — no connection to mcp.linear.app is ever opened, and no MCP
 //   configuration exists. The 26 tools below are the entire surface.
 //
@@ -49,7 +50,8 @@
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
 
 // The plugin source lives outside any pnpm tree, so a bare import('@deepseek-ai/dsh-tools')
 // cannot resolve from here. Every dependency is therefore requested as a STANDARD bare
@@ -69,8 +71,21 @@ import { dirname, join } from 'node:path'
 //
 // Resolution order for every dependency below (identical shape):
 //   1. the DSH_LINEAR_* override env var (explicit entry, any resolvable path/URL)
-//   2. plain Node resolution of the bare specifier from this file
-//   3. the same bare specifier resolved from the dsh install root
+//   2. for @deepseek-ai/dsh-tools only: the same bare specifier resolved from the
+//      running DSH process entry point (process.argv[1], when it is an absolute
+//      existing path), so defineTool comes from the host that launched us
+//   3. plain Node resolution of the bare specifier from this file
+//   4. the same bare specifier resolved from the dsh install root
+//
+// Step 2 exists because a full copy of @deepseek-ai/dsh-tools installed next to this
+// plugin is a SECOND instance of that package. The DSH PTC scheduler keeps its state on
+// a private per-module Symbol, so a tool compiled by one dsh-tools instance and executed
+// by another trips "Cannot read properties of undefined (reading 'prepare')". That
+// cross-instance failure is a reproducible mechanism, and it is the leading explanation
+// for the live error this packaging change targets — not a proven account of which copy
+// was loaded in that session. Binding defineTool to the host's own copy removes the
+// condition either way. @deepseek-ai/schemastery keeps its original resolution order —
+// it carries no such per-module state.
 
 /** Resolve a bare specifier to a file:// URL, or undefined if nothing provides it. */
 function tryResolveFrom(fromFile, specifier) {
@@ -83,6 +98,24 @@ function tryResolveFrom(fromFile, specifier) {
 
 /** This file's path — the anchor for plain (package.json-driven) resolution. */
 const selfPath = fileURLToPath(import.meta.url)
+
+/**
+ * Anchor for host-side resolution: the entry point of the process that is running us, taken
+ * from process.argv[1] and accepted only when it is an absolute path that exists. Resolving
+ * '@deepseek-ai/dsh-tools' from the host's own module tree hands back the SAME instance the
+ * harness already loaded — which is what keeps defineTool bound to the host runtime rather
+ * than a second copy installed beside this plugin, and is why this anchor exists even though
+ * the live error it defends against has not been attributed to a specific loaded copy.
+ * Derived from process.argv[1] alone — no
+ * hardcoded machine paths — and undefined for any other shape (relative path, missing file,
+ * REPL with no argv[1]).
+ */
+function dshProcessEntryAnchor() {
+  const entry = process.argv[1]
+  if (typeof entry !== 'string' || !entry.trim() || !isAbsolute(entry)) return undefined
+  if (!existsSync(entry)) return undefined
+  return entry
+}
 
 /**
  * Anchor for peer resolution inside a dsh install: the installed @deepseek-ai/dsh package
@@ -129,9 +162,10 @@ function fallbackNodeModulesRoots() {
  * race-free; if nothing resolves, the plain specifier is returned so import() raises Node's
  * own module-not-found error.
  *
- * Peer dependencies are declared as BOTH `dependencies` and `peerDependencies`, because
- * either location may be what Node finds — a copy installed next to this plugin, or the host
- * dsh install's copy.
+ * @deepseek-ai/dsh-tools is NOT a peer installed beside this plugin any more: it is provided
+ * by the host dsh install (declared as an optional peer so no package manager installs or
+ * hoists its own copy over the runtime's). That is why resolveDshToolsEntry() prefers the
+ * running process's entry point — see dshProcessEntryAnchor. schemastery keeps this shape.
  */
 function resolveEntry(override, specifier) {
   if (override) return override
@@ -147,8 +181,19 @@ function tryResolveFromFromRoots(specifier) {
   return undefined
 }
 
+/**
+ * dsh-tools specifically: the host process's own copy first, then the usual chain. The
+ * process-entry anchor comes BEFORE plain resolution from this file on purpose — a copy of
+ * dsh-tools sitting in this plugin's node_modules (devDependency, or left over from an older
+ * install) would win and give us a second instance whose private per-module Symbol
+ * the host scheduler cannot see; that is the failure mode this order defends against,
+ * whether or not such a copy was ever actually loaded in a given session.
+ */
 function resolveDshToolsEntry() {
-  return resolveEntry(process.env.DSH_LINEAR_TOOLS, '@deepseek-ai/dsh-tools')
+  const specifier = '@deepseek-ai/dsh-tools'
+  const override = process.env.DSH_LINEAR_TOOLS
+  if (override) return override
+  return tryResolveFrom(dshProcessEntryAnchor(), specifier) ?? tryResolveFrom(selfPath, specifier) ?? tryResolveFrom(dshInstallAnchor(), specifier) ?? tryResolveFromFromRoots(specifier) ?? specifier
 }
 
 // Same resolution chain, but for the schemastery schema lib (used to declare the plugin Config).
@@ -172,9 +217,41 @@ const API_URL = 'https://api.linear.app/graphql'
 // GraphQL client
 // ---------------------------------------------------------------------------
 
+// Credential resolution order — precedence is fixed and never widened:
+//   1. config.apiKey (non-empty patch-row value)
+//   2. LINEAR_API_KEY environment variable
+//   3. the standard local key file ~/.config/linear/api-key, i.e.
+//      join(homedir(), '.config', 'linear', 'api-key')
+// The key file is read with fs only — no subprocess, no network — and its
+// contents are never logged or written anywhere; only the trimmed string is
+// returned. A missing, unreadable, or blank file is simply "no key": it falls
+// through to the same clear configuration error as the other two sources.
+// The path is resolved per call, so a test that isolates its own home directory
+// by pointing HOME/USERPROFILE at a throwaway directory is honoured without a
+// restart. There is no key-file override env var: the path is exactly the one
+// above, and nothing widens it or changes the precedence.
+function keyFilePath() {
+  return join(homedir(), '.config', 'linear', 'api-key')
+}
+
+// The key-file path is resolved per call so homedir() (and therefore the home
+// directory a test isolates itself in) is read fresh each time.
+function readKeyFile() {
+  try {
+    const raw = readFileSync(keyFilePath(), 'utf8')
+    const trimmed = raw.trim()
+    return trimmed || undefined
+  } catch {
+    // Missing file, a directory where the key file should be, or a permission
+    // error — all mean "no key from the file". The reason is deliberately not
+    // surfaced: it must never be the file's contents.
+    return undefined
+  }
+}
+
 function resolveKey(config) {
-  const key = config?.apiKey || process.env.LINEAR_API_KEY
-  if (!key) throw new Error('Linear API key not configured: set the LINEAR_API_KEY environment variable (or pass `apiKey` in plugin config).')
+  const key = config?.apiKey || process.env.LINEAR_API_KEY || readKeyFile()
+  if (!key) throw new Error('Linear API key not configured: set the LINEAR_API_KEY environment variable, pass `apiKey` in plugin config, or put the key in ~/.config/linear/api-key.')
   return key
 }
 
@@ -1430,7 +1507,8 @@ function registerLinearTools(ctx, config) {
 /**
  * Plugin config:
  *   apiKey: Linear personal API key (li_api_...) for the GraphQL tools.
- *           Falls back to the LINEAR_API_KEY environment variable when unset.
+ *           Falls back to the LINEAR_API_KEY environment variable, and then to
+ *           the key file ~/.config/linear/api-key, when unset.
  *
  * There is no other config. The plugin has no MCP side: it neither hosts an
  * MCP server nor connects to one, and it reads no MCP-related setting or
@@ -1438,10 +1516,11 @@ function registerLinearTools(ctx, config) {
  */
 // Cordis validates a plugin's `Config` as a Standard Schema (it calls
 // Config["~standard"].validate(...)). The real API key still comes from the
-// LINEAR_API_KEY env var (see resolveKey); this schema only needs to accept an
-// optional `apiKey` string so a patch row may also supply one. `.default('')`
-// makes a missing field valid; the empty value is ignored by resolveKey, which
-// prefers config.apiKey only when it is non-empty and otherwise falls back to env.
+// LINEAR_API_KEY env var or the ~/.config/linear/api-key file (see resolveKey);
+// this schema only needs to accept an optional `apiKey` string so a patch row
+// may also supply one. `.default('')` makes a missing field valid; the empty
+// value is ignored by resolveKey, which prefers config.apiKey only when it is
+// non-empty and otherwise falls back to env, then the key file.
 const Config = z.object({
   apiKey: z.string().default(''),
 })

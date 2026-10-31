@@ -1,7 +1,7 @@
 {
   "name": "@kb1slnlabs/dsh-linear",
   "description": "Model-facing Linear issue-tracking tools (read, create, update, comments, relations, projects, teams, labels) over the Linear GraphQL API — direct GraphQL only, no MCP server or client",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -32,11 +32,18 @@
     "access": "public"
   },
   "dependencies": {
-    "@deepseek-ai/dsh-tools": "0.2.1-rc.3",
     "@deepseek-ai/schemastery": "3.18.2"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "^0.2.1-rc.3",
     "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.3"
   }
 }

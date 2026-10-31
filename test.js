@@ -10,10 +10,18 @@
 
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname } from 'node:path'
+import { createRequire } from 'node:module'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
+
+// The real home directory, captured before any test redirects HOME/USERPROFILE.
+// Only used to assert that the key-file fallback tests never touch a real
+// ~/.config/linear/api-key — its contents are never read by this suite.
+const realHomeDir = homedir()
 
 // Capture the real key BEFORE the test overwrites LINEAR_API_KEY with a fake
 // value below (line ~36) and deletes it at the end. The introspection guard
@@ -1040,16 +1048,157 @@ r = await out('linear_team_get', { id: 'NOPE' })
 assert.ok(r.error && /Team not found: NOPE/.test(r.error), `team_get with unknown key fails cleanly, got: ${r.error}`)
 
 // missing key -> clear JSON error (the execute guard converts the thrown
-// "Linear API key not configured" into a { error } payload)
+// "Linear API key not configured" into a { error } payload). With no env var and
+// no config value, resolveKey now falls through to the key file — so HOME /
+// USERPROFILE are pointed at an empty temp directory. That keeps this call off
+// the real ~/.config/linear/api-key (which on some machines holds a live
+// credential) while still proving the file fallback is reached: an empty isolated
+// home yields no key from anywhere.
+// The amended message must name all three sources.
+const fakeHome = mkdtempSync(join(tmpdir(), 'dsh-linear-nohome-'))
+const realHomeEnv = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
+const isolateHome = () => {
+  process.env.HOME = fakeHome
+  process.env.USERPROFILE = fakeHome
+}
+const restoreRealHome = () => {
+  if (realHomeEnv.HOME === undefined) delete process.env.HOME
+  else process.env.HOME = realHomeEnv.HOME
+  if (realHomeEnv.USERPROFILE === undefined) delete process.env.USERPROFILE
+  else process.env.USERPROFILE = realHomeEnv.USERPROFILE
+}
+isolateHome()
 delete process.env.LINEAR_API_KEY
 const noKey = JSON.parse(await byName.linear_team_list.execute({}, { signal: new AbortController().signal }))
 assert.ok(noKey.error && /Linear API key not configured/.test(noKey.error), `missing key yields a clear error, got: ${noKey.error}`)
+assert.match(noKey.error, /\.config.{0,12}linear.{0,12}api-key/, `the configuration error also names the key file, got: ${noKey.error}`)
 
 globalThis.fetch = realFetch
 server.close()
 console.log(`ok - ${seen.length} GraphQL calls verified against mock (auth, flat UUID inputs, plural-field resolution, negative cases)`)
 
-// --- 5. Introspection guard ---------------------------------------------------
+// --- 5. Credential fallback: config > env > ~/.config/linear/api-key ---------
+// Entirely offline and isolated: every call below runs with HOME/USERPROFILE
+// pointed at a throwaway directory under the OS temp dir (set in section 4), so
+// the real user's ~/.config/linear/api-key is never opened. The dummy keys are
+// literals; nothing here reads or prints a real credential. No tool call reaches
+// the network in this section: global fetch is replaced by a recorder for its
+// whole duration, so any request that happens is captured and compared instead of
+// sent — and a call that fails key resolution never builds a request at all.
+const recordedAuth = []
+globalThis.fetch = (url, init) => {
+  assert.equal(url, 'https://api.linear.app/graphql', 'fetch hits the Linear API URL')
+  recordedAuth.push(init?.headers?.Authorization ?? init?.headers?.authorization)
+  return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: {} }) })
+}
+
+// The previous section restored the real home when it ended, so re-point HOME and
+// USERPROFILE at the temp home for every fallback call below.
+isolateHome()
+
+const keyFileDir = join(fakeHome, '.config', 'linear')
+const keyFilePath = join(keyFileDir, 'api-key')
+const writeKeyFile = (contents) => {
+  mkdirSync(keyFileDir, { recursive: true })
+  writeFileSync(keyFilePath, contents)
+}
+
+// Isolation: the fallback path is join(homedir(), '.config', 'linear', 'api-key'),
+// and homedir() on this machine follows USERPROFILE/HOME dynamically. Every call
+// below therefore runs with HOME/USERPROFILE pointed at a throwaway directory
+// under the OS temp dir (set in section 4), so this suite never opens the real
+// ~/.config/linear/api-key — on a machine that already has one, that file would be
+// a live credential. The guard below proves the isolation took effect by proving
+// the *default* path is NOT being read: with nothing set, resolution must fail
+// even though this machine may hold a real key at its own home path… it cannot
+// prove that without touching the real file, so the temp home is what the fallback
+// resolves to, and it is deleted at the end.
+assert.ok(keyFilePath.startsWith(fakeHome), 'isolation: the key-file path under test is inside the temp home')
+
+const KEYFILE_ERROR = /Linear API key not configured/
+try {
+  // (a) missing file, no env, no config -> the same clear configuration error,
+  // and no request is attempted at all.
+  delete process.env.LINEAR_API_KEY
+  let g = await out('linear_team_list', {})
+  assert.ok(g.error && KEYFILE_ERROR.test(g.error), `no credential anywhere -> clear error, got: ${g.error}`)
+  assert.equal(recordedAuth.length, 0, 'no request is attempted when no credential resolves')
+
+  // (b) a blank-only file (whitespace and newlines) counts as no key.
+  writeKeyFile('   \n\t\n')
+  g = await out('linear_team_list', {})
+  assert.ok(g.error && KEYFILE_ERROR.test(g.error), `blank key file -> clear error, got: ${g.error}`)
+  assert.equal(recordedAuth.length, 0, 'a blank key file still sends no request')
+
+  // (c) an unreadable file — here the path is a directory, so readFileSync throws
+  // EISDIR — counts as no key rather than crashing.
+  rmSync(keyFilePath, { force: true })
+  mkdirSync(keyFilePath, { recursive: true })
+  g = await out('linear_team_list', {})
+  assert.ok(g.error && KEYFILE_ERROR.test(g.error), `unreadable key file -> clear error, got: ${g.error}`)
+  rmSync(keyFilePath, { recursive: true, force: true })
+
+  // (d) the file is used when it is the only credential, and its value is
+  // trimmed — surrounding whitespace and newlines are not part of the key.
+  const FILE_KEY = 'li_api_file_key_DUMMY'
+  writeKeyFile(`\n  ${FILE_KEY}  \r\n`)
+  g = await out('linear_team_list', {})
+  assert.equal(recordedAuth.at(-1), FILE_KEY, `key file value sent trimmed as Authorization (got: ${JSON.stringify(recordedAuth.at(-1))})`)
+
+  // (e) precedence: the env var beats the key file.
+  const ENV_KEY = 'li_api_env_key_DUMMY'
+  process.env.LINEAR_API_KEY = ENV_KEY
+  g = await out('linear_team_list', {})
+  assert.equal(recordedAuth.at(-1), ENV_KEY, 'LINEAR_API_KEY wins over the key file')
+
+  // (f) precedence: config.apiKey beats env AND the file — the existing order is
+  // preserved and the file only ever fills in when both are unset. A separate
+  // apply() is needed here because the section-2 instance was created with {}.
+  const CONFIG_KEY = 'li_api_config_key_DUMMY'
+  const configDefs = []
+  mod.apply({ tools: { register: (def) => { configDefs.push(def); return () => {} } } }, { apiKey: CONFIG_KEY })
+  const configTool = Object.fromEntries(configDefs.map((d) => [d.name, d]))
+  g = JSON.parse(await configTool.linear_team_list.execute({}, { signal: new AbortController().signal }))
+  assert.equal(recordedAuth.at(-1), CONFIG_KEY, 'config.apiKey wins over env and the key file')
+
+  // (g) an empty config value is not a credential: it falls through to env, then
+  // to the file — the documented `.default('')` behaviour of the Config schema.
+  // A separate apply() with apiKey: '' is needed here because the instance above
+  // was created with a non-empty CONFIG_KEY.
+  delete process.env.LINEAR_API_KEY
+  const emptyConfigDefs = []
+  mod.apply({ tools: { register: (def) => { emptyConfigDefs.push(def); return () => {} } } }, { apiKey: '' })
+  const emptyConfigTool = Object.fromEntries(emptyConfigDefs.map((d) => [d.name, d]))
+  g = JSON.parse(await emptyConfigTool.linear_team_list.execute({}, { signal: new AbortController().signal }))
+  assert.equal(recordedAuth.at(-1), FILE_KEY, 'empty config.apiKey falls through to the key file')
+
+  // (h) with the file gone again, an empty config value still yields the clear
+  // error rather than sending an empty Authorization header.
+  rmSync(keyFilePath, { force: true })
+  g = JSON.parse(await emptyConfigTool.linear_team_list.execute({}, { signal: new AbortController().signal }))
+  assert.ok(g.error && KEYFILE_ERROR.test(g.error), `no credential anywhere with empty config -> clear error, got: ${g.error}`)
+
+  // (i) key lookup uses fs only — no subprocess and no network. child_process is
+  // not imported by index.js at all, and the file read goes through readFileSync.
+  const idxSrc = readFileSync(join(here, 'index.js'), 'utf8')
+  assert.ok(!/child_process|execSync|spawnSync|\.execFile/.test(idxSrc), 'key lookup spawns no subprocess (index.js never imports child_process)')
+  assert.match(idxSrc, /readFileSync\(keyFilePath\(\)/, 'the key file is read with fs.readFileSync')
+  assert.ok(!/writeFileSync|appendFile/.test(idxSrc), 'index.js never writes a key anywhere')
+  for (const dummy of [FILE_KEY, ENV_KEY, CONFIG_KEY]) {
+    assert.ok(!idxSrc.includes(dummy), `no dummy key literal is baked into index.js (${dummy})`)
+  }
+} finally {
+  // Remove the fabricated key file and the temp home, then restore the real home
+  // environment for the rest of the suite.
+  rmSync(fakeHome, { recursive: true, force: true })
+  restoreRealHome()
+  globalThis.fetch = realFetch
+}
+delete process.env.LINEAR_API_KEY
+
+console.log('ok - credential fallback: config > env > ~/.config/linear/api-key; file value trimmed; missing/blank/unreadable file -> the same clear error naming the key file; no subprocess; offline and isolated from the real home')
+
+// --- 6. Introspection guard ---------------------------------------------------
 // The check that would have caught both bugs before they shipped: introspect the
 // REAL Linear schema and assert that every field the plugin emits on the input
 // types and query fields actually exists. Runs live only when LINEAR_API_KEY is
@@ -1057,6 +1206,8 @@ console.log(`ok - ${seen.length} GraphQL calls verified against mock (auth, flat
 //
 // The introspection request goes to the real endpoint directly (not through the
 // monkey-patched fetch), so it is independent of the mock above.
+// The credential section deliberately clears LINEAR_API_KEY, so the real key
+// captured at the top of this file is what decides here.
 const realKey = REAL_LINEAR_KEY
 if (realKey) {
   // Linear's introspection endpoint rejects the standard `... on INPUT_OBJECT`
@@ -1224,5 +1375,78 @@ if (realKey) {
 } else {
   console.log('skip - introspection guard (no LINEAR_API_KEY in this environment; set it to run the live schema check)')
 }
+
+// --- 6. dsh-tools is host-provided, not shipped as a direct dependency -------
+// DSH's PTC scheduler keeps its state on a private per-module Symbol. A second
+// copy of @deepseek-ai/dsh-tools installed beside this plugin is a second
+// instance of that package, and a tool compiled by one instance and run by the
+// other trips "Cannot read properties of undefined (reading 'prepare')". So
+// dsh-tools must come from the host: no production dependency on it, the peer
+// requirement kept but marked optional so pnpm does not auto-install/hoist a
+// copy, and resolution preferring the running DSH process entry point.
+const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'))
+
+assert.equal(manifest.dependencies['@deepseek-ai/dsh-tools'], undefined, 'no production dependency on @deepseek-ai/dsh-tools')
+assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-tools'], '^0.2.1-rc.3', 'peer requirement kept as ^0.2.1-rc.3')
+assert.equal(manifest.peerDependenciesMeta['@deepseek-ai/dsh-tools'].optional, true, '@deepseek-ai/dsh-tools peer marked optional')
+assert.equal(manifest.devDependencies['@deepseek-ai/dsh-tools'], '0.2.1-rc.3', 'devDependency pinned to 0.2.1-rc.3 for local tests')
+
+// The lockfile must agree with the manifest, and must not carry dsh-tools as a
+// production package — a non-dev entry there is what lands in an installed profile.
+const lock = JSON.parse(readFileSync(join(here, 'package-lock.json'), 'utf8'))
+assert.equal(lock.version, manifest.version, `package-lock version matches package.json (${manifest.version})`)
+assert.equal(lock.packages[''].version, manifest.version, 'lockfile root version matches package.json')
+for (const key of ['dependencies', 'devDependencies', 'peerDependencies', 'peerDependenciesMeta']) {
+  assert.deepEqual(lock.packages[''][key], manifest[key], `lockfile root ${key} matches package.json`)
+}
+const dshToolsPkgs = Object.keys(lock.packages).filter((p) => /@deepseek-ai\/dsh-tools(\/|$)/.test(p))
+assert.ok(dshToolsPkgs.length > 0, 'lockfile still pins @deepseek-ai/dsh-tools for local dev')
+for (const p of dshToolsPkgs) {
+  assert.equal(lock.packages[p].dev, true, `lockfile entry ${p} is dev-only, so it is not installed into a consumer profile`)
+}
+
+// Packaging: the published tarball must not depend on anything being resolved from
+// this checkout's own node_modules.
+assert.ok(manifest.files.includes('index.js'), 'index.js is published')
+
+// Resolution order, read off the resolver source itself (the resolvers are not
+// exported): dsh-tools resolves from process.argv[1] BEFORE plain resolution
+// from this file, schemastery keeps its original chain untouched.
+const src = readFileSync(join(here, 'index.js'), 'utf8')
+const toolsFn = /function resolveDshToolsEntry\(\)\s*\{[\s\S]*?\n\}/.exec(src)
+assert.ok(toolsFn, 'resolveDshToolsEntry is present in index.js')
+const toolsBody = toolsFn[0]
+for (const anchor of ['dshProcessEntryAnchor()', 'selfPath', 'dshInstallAnchor()', 'tryResolveFromFromRoots']) {
+  assert.ok(toolsBody.includes(anchor), `dsh-tools resolution tries ${anchor}`)
+}
+assert.ok(
+  toolsBody.indexOf('dshProcessEntryAnchor()') < toolsBody.indexOf('selfPath'),
+  'dsh-tools prefers the running DSH process entry point over this file\u2019s own node_modules',
+)
+const schemaFn = /function resolveDshSchemasteryEntry\(\)\s*\{[\s\S]*?\n\}/.exec(src)
+assert.ok(schemaFn, 'resolveDshSchemasteryEntry is present in index.js')
+assert.match(schemaFn[0], /resolveEntry\(process\.env\.DSH_LINEAR_SCHEMA, '@deepseek-ai\/schemastery'\)/, 'schemastery resolution unchanged (no process-entry anchor)')
+
+// The host-entry anchor accepts only an absolute existing path — no hardcoded
+// machine paths anywhere in the resolver.
+const anchorFn = /function dshProcessEntryAnchor\(\)\s*\{[\s\S]*?\n\}/.exec(src)
+assert.ok(anchorFn, 'dshProcessEntryAnchor is present in index.js')
+assert.match(anchorFn[0], /process\.argv\[1\]/, 'the host anchor is derived from process.argv[1]')
+assert.match(anchorFn[0], /isAbsolute/, 'a relative argv[1] is rejected')
+assert.match(anchorFn[0], /existsSync/, 'a non-existent argv[1] is rejected')
+assert.ok(!/[A-Za-z]:\\\\Users|[A-Za-z]:\\Users/.test(src), 'no hardcoded Windows user paths in index.js')
+
+// And the anchor really hands resolution to the host tree: point argv[1] at a
+// throwaway script inside this repo and confirm dsh-tools resolves from here.
+const probeFile = join(here, '.resolution-probe.mjs')
+try {
+  writeFileSync(probeFile, '')
+  const probed = createRequire(probeFile).resolve('@deepseek-ai/dsh-tools')
+  assert.ok(probed.includes(join('node_modules', '@deepseek-ai', 'dsh-tools')), `argv[1]-anchored resolution finds a dsh-tools copy: ${probed}`)
+} finally {
+  rmSync(probeFile, { force: true })
+}
+
+console.log('ok - dsh-tools is host-provided: no prod dependency, optional peer ^0.2.1-rc.3, dev-only lockfile entries, resolution prefers the DSH process entry point, schemastery untouched')
 
 console.log('\nAll checks passed.')

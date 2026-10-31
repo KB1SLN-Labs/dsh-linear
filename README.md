@@ -23,9 +23,9 @@ entire surface; nothing else is registered under any condition.
 > bounded by Linear's own API and by your key's permissions, so it extends
 > coverage, it does not guarantee parity. See [Limitations](#limitations).
 
-> Status: this is **version 0.2.1** of the standalone implementation — the
+> Status: this is **version 0.2.2** of the standalone implementation — the
 > GitHub release for it is
-> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1),
+> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2),
 > and the package is published on npm as `@kb1slnlabs/dsh-linear`. The earlier
 > **0.1.0** release, also on the public GitHub repository `KB1SLN-Labs/dsh-linear`
 > and on npm, shipped with an MCP bridge to Linear's hosted MCP server; that
@@ -121,24 +121,61 @@ this one deliberately carries none of that.
 
 ## Configuration
 
-One credential, resolved by the plugin at apply time:
+One credential — **your own Linear personal API key** (create it in Linear's
+settings; keep it private, never paste it into a conversation, screenshot, issue,
+commit, or log). The plugin resolves it at apply time from three sources. The
+precedence is fixed and never widened — first non-empty source wins:
+
+| Order | Source | Notes |
+|---|---|---|
+| 1 | `apiKey` in the plugin config (patch row) | used only when it is **non-empty**; the schema's `.default('')` means an absent field resolves to `""`, which falls through |
+| 2 | `LINEAR_API_KEY` environment variable | as seen by the plugin process at call time |
+| 3 | the key file `~/.config/linear/api-key` | exactly `join(homedir(), '.config', 'linear', 'api-key')`; read with `fs` only (no subprocess, no network), value sent trimmed; a missing, unreadable, or blank file counts as "no key" |
+
+If none of the three yields a key, every tool returns
+`{ "error": "Linear API key not configured: …" }` — the message names all three
+sources — instead of throwing. There is no fourth source, no override env var for
+the key-file path, and nothing that changes or widens this order.
 
 | Setting | Env var | Plugin config | Used for | Header sent |
 |---|---|---|---|---|
 | GraphQL key | `LINEAR_API_KEY` | `apiKey` | all 26 `linear_*` tools, incl. `linear_graphql` | `Authorization: <raw key>` — **not** `Bearer` |
 
 ```powershell
-# PowerShell (current session)
+# PowerShell (current session) — replace the placeholder, do not use a real key here
 $env:LINEAR_API_KEY = "li_api_..."
 
 # or persist for the user
 setx LINEAR_API_KEY "li_api_..."
 ```
 
-The `dsh` launcher inherits the parent environment, so any harness started after a
-variable is set will see it. A config `apiKey` in the patch row wins over the env
-var; when it is empty or absent, the env var is used. With neither set, every tool
-returns `{ "error": "Linear API key not configured: …" }` instead of throwing.
+Or skip the environment entirely and put the key in one of the other two sources.
+The key file has no format beyond the key itself — write it as **the only content
+of the file**, nothing else:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.config\linear" | Out-Null
+# paste your own key in place of the placeholder, then save the file
+Set-Content -NoNewline -Path "$HOME\.config\linear\api-key" -Value "li_api_..."
+```
+
+Any one of the three is enough; you do not need to configure all of them. If you
+set more than one, the table above decides which is used — an `apiKey` config value
+shadows both `LINEAR_API_KEY` and the key file, and a non-empty `LINEAR_API_KEY`
+shadows the key file.
+
+The `dsh` launcher inherits the environment of **its own parent process**. Setting a
+user variable with `setx` does not push it into processes that are already running,
+and it is not guaranteed to reach every launcher: anything started from an existing
+parent (an already-running Desktop/app session, a service, a scheduled or terminal
+session opened before the change) keeps the environment that parent had. In practice
+this means **a Desktop instance that was already running when you set
+`LINEAR_API_KEY` will not see it** — fully quit Desktop (tray process included) and
+start it again from a shell that has the variable, or start Desktop fresh from the
+taskbar after signing out and back in. To be sure a given harness sees
+`LINEAR_API_KEY`, start it from a shell that has the variable —
+or skip the environment entirely and put the key in the config `apiKey` or the
+key-file path above, which do not depend on inherited environment at all.
 
 That is the whole config object:
 
@@ -151,15 +188,77 @@ no MCP-related setting, opens no non-GraphQL connection, and an `mcp` block left
 an old profile's config is simply ignored (the schema declares no such field).
 
 The repo's own `cordis.patch.yml` inserts the plugin with **no config at all** — it
-relies on the environment variables.
+relies on `LINEAR_API_KEY` or the `~/.config/linear/api-key` file.
 
 Override env vars used to pin dependency resolution (mainly for offline tests):
 `DSH_LINEAR_TOOLS`, `DSH_LINEAR_SCHEMA`.
 
 ## Install
 
-This is **version 0.2.1** of the standalone implementation; its release is
-[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.1),
+### Windows quick start (DSH Desktop)
+
+If you use **DSH Desktop**, follow this first. **Desktop and web are separate
+profiles**: installing the plugin into one does not make it available in the
+other. The commands further down this section target the **web profile**.
+
+1. **Quit DSH Desktop completely**, including its tray process — closing the
+   window is not enough. Check the system tray, and confirm no harness process is
+   left:
+
+   ```powershell
+   Get-Process | Where-Object { $_.ProcessName -like "*DeepSeek*" }
+   ```
+
+2. **Install the plugin into the Desktop profile** with the DSH CLI bundled inside
+   the Desktop installation (verified path — this is the one to use for Desktop;
+   do not rely on a `dsh` on your PATH, which may belong to a different install):
+
+   ```powershell
+   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.2
+   ```
+
+3. **Reopen DSH Desktop and start a new conversation.** A session that was already
+   open will not pick up the newly installed plugin.
+
+4. **Give the plugin a Linear API key** — see
+   [Configuration](#configuration) below for the three sources, their precedence,
+   and why an environment variable you just set may not reach Desktop. Use your own
+   personal Linear API key; never paste a real key into a chat, screenshot, issue,
+   or log, and do not share one with anyone.
+
+5. **Check that it works**, read-only, from the new conversation:
+
+   ```
+   Use linear_issue_get to read <issue-id> and report its title and status
+   ```
+
+   Replace `<issue-id>` with an issue you can see, e.g. `TEAM-123`. A correct answer
+   means the plugin loaded **and** the key resolved.
+
+0.2.2 needs a **full DSH host that satisfies the peer range below** — it will not
+load into a bare base-only profile (see
+[Dependencies provided by the host](#dependencies-provided-by-the-host)). The
+Desktop runtime it has actually been tested against is **0.2.1-rc.3**; other
+platforms and runtimes are untested, and no real write to Linear has been
+verified end-to-end (see
+[What is verified vs. what is not](#what-is-verified-vs-what-is-not)).
+
+**If something goes wrong:**
+
+- **No `linear_*` tools appear** → you most likely installed into the other
+  profile: Desktop and web are separate. Re-run step 2 with `--profile desktop`,
+  then start a **new** conversation — an existing one keeps the old tool list.
+- **`Linear API key not configured`** → none of the three sources in the
+  [Configuration](#configuration) table is yielding a key; check all three, and
+  remember that a variable set after Desktop started may never reach it.
+- **PTC prepare error — `Cannot read properties of undefined (reading 'prepare')`
+  — on 0.2.1** → install the 0.2.2 package as above (it removes the duplicate
+  `@deepseek-ai/dsh-tools` copy that causes this) and restart Desktop.
+
+### The four install routes below are web-profile alternatives
+
+This is **version 0.2.2** of the standalone implementation; its release is
+[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2),
 and the tarball attached to that release — `kb1slnlabs-dsh-linear.tgz` — is the
 pinned artifact for route 4 below. Four install routes:
 
@@ -176,21 +275,26 @@ dsh plugin --profile web add github:KB1SLN-Labs/dsh-linear
 # 3. from npm, by package name (latest published version)
 dsh plugin --profile web add @kb1slnlabs/dsh-linear
 
-# 4. version-pinned release asset — download the tarball attached to the v0.2.1
+# 4. version-pinned release asset — download the tarball attached to the v0.2.2
 #    GitHub release, then install it from disk:
-#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.1/kb1slnlabs-dsh-linear.tgz
+#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.2/kb1slnlabs-dsh-linear.tgz
 dsh plugin --profile web add file:./kb1slnlabs-dsh-linear.tgz
 ```
+
+All four write to the **web** profile (`--profile web`). For DSH Desktop use the
+bundled CLI and `--profile desktop` from the quick start above. If you want one of
+these exact routes for Desktop, swap `--profile web` for `--profile desktop` and
+invoke the bundled `dsh.cmd` instead of a bare `dsh`.
 
 Route 1 (`link:`) points pnpm at the directory rather than copying it, so the profile
 picks up edits in place. Use an **absolute** path — that is what this repo's own install
 used, and it is what makes the spec unambiguous regardless of where `dsh plugin` runs
 from. Routes 2–4 install a copy instead, so later source edits do not leak into the
 profile. Only route 4 pins an exact version: `kb1slnlabs-dsh-linear.tgz` is the fixed
-release-asset name for the v0.2.1 GitHub release — renamed from the output of
+release-asset name for the v0.2.2 GitHub release — renamed from the output of
 `npm pack`, not the filename npm itself generates. Route 2 follows the repository's
 default branch and route 3 follows npm's `latest`, so neither is guaranteed to install
-0.2.1 once newer work or releases exist; use route 4 when reproducibility matters.
+0.2.2 once newer work or releases exist; use route 4 when reproducibility matters.
 
 The clean scratch profile behind the verification described under
 [Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
@@ -202,6 +306,8 @@ To add it as a plain dependency instead of a link, use `file:<absolute-path>` or
 packaged tarball (`npm pack`, then `dsh plugin --profile web add file:<path-to-tgz>`) —
 that is how the scratch profile used by [Testing](#testing) was built.
 
+### Dependencies provided by the host
+
 Peer dependencies `@deepseek-ai/dsh-tools` and `@deepseek-ai/cordis`, plus the
 `@deepseek-ai/schemastery` this package depends on, normally resolve from the **dsh
 install's own** `node_modules`. The plugin resolves each dependency as a bare specifier
@@ -209,27 +315,56 @@ first, then from an anchor derived portably from `process.execPath` (the npm/pnp
 prefix), then `%APPDATA%/npm/node_modules` on Windows or `/usr/local/lib/node_modules` /
 `/usr/lib/node_modules` on POSIX.
 
-The `@deepseek-ai/dsh-tools` this package pins as a direct dependency (`0.2.1-rc.3`) is
-the copy that was verified against **DSH Desktop 0.2.1-rc.3**. A **bare base-only
-profile can fail to load** the plugin: the pinned `@deepseek-ai/dsh-tools` needs host
-peers such as `@deepseek-ai/dsh-sandbox`, which a base-only profile does not provide —
-this is a load failure, not a warning you can ignore. Use a **full web or Desktop
-profile** instead.
+The `@deepseek-ai/dsh-tools` this package needs is **provided by the host DSH runtime**, not shipped with it. It is a `peerDependency` at `^0.2.1-rc.3`, marked
+**optional** in `peerDependenciesMeta` so package managers do not auto-install or
+hoist their own copy into the profile, and it appears only in `devDependencies`
+(`0.2.1-rc.3`) for local test use — the lockfile entries are `dev`-only, so an
+installed profile gets no `@deepseek-ai/dsh-tools` of its own.
+
+Why: DSH's PTC scheduler keeps its state on a **private per-module Symbol**. A copy
+of `@deepseek-ai/dsh-tools` installed at the profile root is a second instance of
+that package, and a tool compiled by one instance and executed by the other trips
+`Cannot read properties of undefined (reading 'prepare')`. That extra copy is what
+this packaging change removes. To bind `defineTool` to the host wherever possible,
+`index.js` resolves `@deepseek-ai/dsh-tools` **first** from the running DSH process
+entry point (`process.argv[1]`, accepted only when it is an absolute path that
+exists), and only then through the fallbacks above. No machine paths are hardcoded.
+`@deepseek-ai/schemastery` keeps its original resolution chain — it carries no such
+per-module state.
+
+> **Status of this explanation:** the mechanism is **demonstrated** — two copies of
+> `@deepseek-ai/dsh-tools` really are two instances, and a tool compiled by one and
+> executed by the other really does trip
+> `Cannot read properties of undefined (reading 'prepare')`, because the PTC
+> scheduler's state lives on a private per-module Symbol. That makes it the **likely
+> explanation** for the live failure, but it has **not** been proven to be the actual
+> cause in the session where the error was seen — see
+[What is verified vs. what is not](#what-is-verified-vs-what-is-not).
+
+A **bare base-only profile can still fail to load** the plugin: `@deepseek-ai/dsh-tools`
+needs host peers such as `@deepseek-ai/dsh-sandbox`, which a base-only profile does
+not provide — this is a load failure, not a warning you can ignore. Use a **full web
+or Desktop profile** instead.
 
 The `@deepseek-ai/dsh-tools` peer requirement in `package.json` is
-`^0.2.1-rc.3`. That matches the direct dependency and names the host this plugin has
-actually been verified against — **DSH Desktop 0.2.1-rc.3**, the loader run described
-under [Testing](#testing). Earlier manifests declared `^0.1.1-rc.2`, and for a while an
-OR range (`^0.1.1-rc.2 || ^0.2.1-rc.3`); both are gone in 0.2.1, because the 0.1 series is
-not a host this release targets. `test.js` does **not** check this range — it checks the
-module surface and the tools (see [Testing](#testing)) — so keep the manifest and the
-lockfile consistent by hand.
+`^0.2.1-rc.3`, which names the host this plugin has actually been verified against —
+**DSH Desktop 0.2.1-rc.3**, the loader run described under [Testing](#testing).
+Earlier manifests declared `^0.1.1-rc.2`, and for a while an OR range
+(`^0.1.1-rc.2 || ^0.2.1-rc.3`); both are gone in 0.2.1, because the 0.1 series is
+not a host this release targets. `test.js` now **does** check this packaging — the
+peer range, its optional marker, the absence of a production dependency on
+dsh-tools, dev-only lockfile entries, and the resolution order described above (see
+[Testing](#testing)) — so keep the manifest and the lockfile consistent.
 
 ## Testing
 
 ```
 node test.js          # module surface (name/inject/apply/Config), 26 tool
-                      # registrations, an `mcp` config proven inert (no extra
+                      # registrations, dsh-tools packaging and resolution (no
+                      # production dependency on it, peer ^0.2.1-rc.3 marked
+                      # optional, dev-only lockfile entries, resolution prefers
+                      # the DSH process entry point, schemastery untouched), an
+                      # `mcp` config proven inert (no extra
                       # tools, no log lines, no effects, no connection), ~183
                       # GraphQL calls against a loopback mock that mirrors the
                       # real Linear schema (flat UUID inputs, plural-field
@@ -326,21 +461,46 @@ profile.
   runtime 0.2.1-rc.3** with the Cordis loader plus `ToolRuntime` — a bare host context,
   **not** a full desktop app boot: no LLM turn, session log, sandbox, or app entry tree
   was started.
-- **Verified (CLI install smoke, separate from the line above):** the **0.2.1 final
+- **Verified (CLI install smoke, against the earlier 0.2.1 tarball):** the **0.2.1 final
   tarball** (`kb1slnlabs-dsh-linear.tgz`, route 4) was installed into a clean scratch
   profile based on the **shipped web template**, and the real Cordis loader test
   (`test-loader.mjs`) run against that profile registered **26 tools** on **DSH runtime
   0.2.1-rc.3**. That is an install-and-load check only: no model turn and no full desktop
-  GUI boot were performed, and **no live desktop conversation was tested**.
+  GUI boot were performed. It predates the 0.2.2 candidate, so it says nothing about that
+  packaging — the only 0.2.2-candidate session evidence is the user report below, not this
+  line.
 - **Verified against live services:** the Linear GraphQL introspection guard in `test.js`
   has run with a real key and passed — the schema fields this plugin emits, including the
   five direct-write mutations, their arguments, and their payload shapes (`ProjectPayload`,
   `CommentPayload`, `DeletePayload`, `IssueArchivePayload`), exist.
+- **Reported by the user (not an automated test):** in a **new conversation on DSH
+  Desktop 0.2.1-rc.3** using the **local 0.2.2 candidate**, a **read-only `APT-941`
+  lookup succeeded**. That is a human report about one session, deliberately kept apart
+  from the automated suites above: it was not run by `test.js`, `test-loader.mjs`, or any
+  script in this repo, and **no live mutations were tested** — nothing wrote to Linear. It
+  shows the plugin loaded and answered a read through the real desktop runtime; it does
+  not prove the packaging explanation below was the cause of the earlier failure.
 - **Not verified:** no run in this repo's check has exercised a real `linear_*` **write**
   end-to-end against `api.linear.app` — the GraphQL half is proven against a mock that
   mirrors the introspected schema (plus the live schema-shape guard above), not against
   real issue mutations. Nothing here was run on more than one Windows host/runtime, so
   treat other platforms as untested.
+- **Reproduced mechanism, likely but unproven cause:** the `@deepseek-ai/dsh-tools`
+  double-instance explanation in
+  [Dependencies provided by the host](#dependencies-provided-by-the-host) — that a
+  profile-root copy shadowed the desktop runtime and produced
+  `Cannot read properties of undefined (reading 'prepare')` — is **reproduced as a
+  mechanism** (a tool compiled by one copy and executed by another really does trip that
+  error, because the scheduler's state is a private per-module Symbol) and is the
+  **likely explanation** for what was seen live. What has *not* been established is that a
+  second copy was in fact the loaded one in that failing session: no evidence captured from
+  the failure itself identifies which copy was in play, so it stays the leading explanation
+  rather than a proven root cause. The packaging contract itself *is* checked by `test.js`:
+  no production dependency on dsh-tools, an optional
+  `^0.2.1-rc.3` peer, dev-only lockfile entries, and resolution that prefers the running
+  DSH process entry point. The only 0.2.2-candidate session evidence available is the
+  user-reported successful read-only lookup above; no automated live run against 0.2.2 has
+  been performed here, and no mutation path has been exercised live.
 
 ## Limitations
 
