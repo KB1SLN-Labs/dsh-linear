@@ -28,7 +28,9 @@
 //   linear_comment_update  — update a comment body (comment UUID)
 //   linear_comment_delete  — delete a comment (comment UUID)
 //   linear_comment_list    — list comments on an issue (cursor pagination)
-//   linear_relation_add    — link a related issue to an issue
+//   linear_relation_add    — link a related issue to an issue (related/blocks/
+//                            blockedBy/duplicate/similar via issueRelationCreate;
+//                            parent/child via issueUpdate parentId)
 //   linear_team_list       — list teams
 //   linear_team_get        — one team by id (UUID) or key
 //   linear_state_list      — list workflow states for a team
@@ -309,9 +311,13 @@ const LABEL_FIELDS = `
   id name color description
 `
 
+// Project.teams is a TeamConnection, NOT a plain object list — selecting
+// `teams { id name key }` is rejected by the live Linear schema ("Field 'teams'
+// must have a selection of subfields / cannot return a scalar"). The connection
+// has to be entered through `nodes`.
 const PROJECT_FIELDS = `
   id name description state
-  teams { id name key }
+  teams { nodes { id name key } }
 `
 
 const CYCLE_FIELDS = `
@@ -329,6 +335,16 @@ const USER_FIELDS = `
 // ---------------------------------------------------------------------------
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// Project teams: the fragment selects the TeamConnection, so the wire shape is
+// `teams { nodes { ... } }`. The public response convention for every project
+// output has always been a FLAT `teams` array, so each of the four project
+// outputs (list/get/create/update) normalizes the connection back to its nodes.
+// A missing or malformed `teams` normalizes to [] rather than inventing entries.
+function normalizeProjectTeams(project) {
+  if (!project || typeof project !== 'object') return project
+  return { ...project, teams: project.teams?.nodes ?? [] }
+}
 
 // Cursor pagination (direct GraphQL list tools).
 //
@@ -392,7 +408,7 @@ async function resolveTeamId(key, ref) {
 // Uses the top-level `workflowStates` query field, filtered by team id + name.
 async function resolveStateId(key, teamId, stateName) {
   const data = await gql(key, `
-    query($teamId: String!, $name: String!) {
+    query($teamId: ID!, $name: String!) {
       workflowStates(filter: { team: { id: { eq: $teamId } }, name: { eq: $name } }) {
         nodes { id name }
       }
@@ -700,7 +716,7 @@ function registerLinearTools(ctx, config) {
 
         // IssueUpdateInput is flat (stateId/assigneeId/labelIds are UUIDs).
         // A state change needs the issue's team to resolve the state name.
-        const input = { id: issueId }
+        const input = {}
         if (args.title !== undefined) input.title = args.title
         if (args.description !== undefined) input.description = args.description
         if (args.assignee !== undefined) input.assigneeId = args.assignee || null
@@ -718,12 +734,12 @@ function registerLinearTools(ctx, config) {
         }
 
         const data = await gql(key(), `
-          mutation($input: IssueUpdateInput!) {
-            issueUpdate(input: $input) {
+          mutation($id: String!, $input: IssueUpdateInput!) {
+            issueUpdate(id: $id, input: $input) {
               success issue { ${ISSUE_FIELDS} }
             }
           }
-        `, { input })
+        `, { id: issueId, input })
         if (!data.issueUpdate.success) return JSON.stringify({ error: 'issueUpdate failed' })
         const i = data.issueUpdate.issue
         return JSON.stringify({
@@ -909,15 +925,43 @@ function registerLinearTools(ctx, config) {
 
   // -- Relations --------------------------------------------------------------
 
+  // Live introspection of the Linear schema (read-only __type queries) pins two
+  // facts this tool depends on:
+  //   - IssueRelationPayload carries the created relation under `issueRelation`,
+  //     NOT `relation` — a document that selects `relation { id }` is rejected,
+  //     so the payload field has to be aliased back (`relation: issueRelation`).
+  //   - IssueRelationType has exactly four members: blocks, duplicate, related,
+  //     similar. There is no "blockedBy" and no "parent"/"child" relation type —
+  //     parent/child in Linear is the issue's `parentId`, not a relation record.
+  // So the five advertised types map onto the schema like this:
+  //   related / blocks / duplicate / similar -> issueRelationCreate with that type
+  //   blockedBy -> issueRelationCreate with type "blocks" and the two issues swapped
+  //                (Linear's `blocks` reads "<issue> blocks <relatedIssue>", so a
+  //                swapped pair is what expresses "issue is blocked by related")
+  //   parent    -> issueUpdate(id: <issue>, input: { parentId: <related> })
+  //   child     -> issueUpdate(id: <related>, input: { parentId: <issue> })
+  // The parent/child routes create no IssueRelation record, so they return
+  // relationId: null alongside the resolved parentId/childId.
+  const RELATION_TYPES = ['related', 'blockedBy', 'blocks', 'parent', 'child', 'duplicate', 'similar']
+  // Tool type -> the IssueRelationType enum value to send (undefined for the two
+  // parent/child routes, which never touch issueRelationCreate).
+  const ISSUE_RELATION_TYPE = {
+    related: 'related',
+    blocks: 'blocks',
+    blockedBy: 'blocks',
+    duplicate: 'duplicate',
+    similar: 'similar',
+  }
+
   register(
     defineTool({
       name: 'linear_relation_add',
       description:
-        'Link a related issue to an issue. Both given by id or identifier. `type` is the relation type (default "related").',
+        'Link a related issue to an issue. Both given by id or identifier. `type` is the relation type (default "related"; also duplicate, similar). Linear has no parent/blockedBy relation record: blockedBy creates a blocks relation in the reverse direction, and parent/child set the child issue\'s parentId through issueUpdate instead — those return relationId null plus parentId/childId.',
       parameters: {
         issue: { type: 'string', required: true, description: 'Source issue id or identifier' },
         related: { type: 'string', required: true, description: 'Related issue id or identifier' },
-        type: { type: 'string', description: 'Relation type: related, blockedBy, blocks, parent, child (default "related")' },
+        type: { type: 'string', description: 'Relation type: related, blockedBy, blocks, parent, child, duplicate, similar (default "related")' },
       },
       output: {
         schema: { type: 'string' },
@@ -925,9 +969,8 @@ function registerLinearTools(ctx, config) {
       },
       async execute(args) {
         const type = args.type ?? 'related'
-        const VALID_RELATION_TYPES = ['related', 'blockedBy', 'blocks', 'parent', 'child']
-        if (!VALID_RELATION_TYPES.includes(type)) {
-          return JSON.stringify({ error: `invalid relation type: ${type}, expected one of: ${VALID_RELATION_TYPES.join(', ')}` })
+        if (!RELATION_TYPES.includes(type)) {
+          return JSON.stringify({ error: `invalid relation type: ${type}, expected one of: ${RELATION_TYPES.join(', ')}` })
         }
         const [issueId, relatedId] = await Promise.all([
           findIssueId(key(), args.issue),
@@ -935,13 +978,44 @@ function registerLinearTools(ctx, config) {
         ])
         if (!issueId) return JSON.stringify({ error: `Issue not found: ${args.issue}` })
         if (!relatedId) return JSON.stringify({ error: `Issue not found: ${args.related}` })
+
+        // parent/child are a parentId assignment, not an IssueRelation record.
+        // Both values travel as GraphQL variables; the mutation signature is
+        // issueUpdate(id: String!, input: IssueUpdateInput!) — the target UUID is
+        // a top-level argument and never goes inside `input`.
+        if (type === 'parent' || type === 'child') {
+          const parentId = type === 'parent' ? relatedId : issueId
+          const childId = type === 'parent' ? issueId : relatedId
+          const data = await gql(key(), `
+            mutation($id: String!, $input: IssueUpdateInput!) {
+              issueUpdate(id: $id, input: $input) {
+                success
+              }
+            }
+          `, { id: childId, input: { parentId } })
+          if (!data.issueUpdate.success) return JSON.stringify({ error: 'issueUpdate failed' })
+          // No IssueRelation record exists for a parent/child link, so there is no
+          // relation id to report — the honest answer is null plus both ends.
+          return JSON.stringify({ ok: true, relationId: null, parentId, childId }, null, 2)
+        }
+
+        // blockedBy is Linear's `blocks` relation read the other way round: the
+        // pair is swapped so the document still says "<issue> blocks <related>".
+        const input = { type: ISSUE_RELATION_TYPE[type] }
+        if (type === 'blockedBy') {
+          input.issueId = relatedId
+          input.relatedIssueId = issueId
+        } else {
+          input.issueId = issueId
+          input.relatedIssueId = relatedId
+        }
         const data = await gql(key(), `
           mutation($input: IssueRelationCreateInput!) {
             issueRelationCreate(input: $input) {
-              success relation { id }
+              success relation: issueRelation { id }
             }
           }
-        `, { input: { issueId, relatedIssueId: relatedId, type } })
+        `, { input })
         if (!data.issueRelationCreate.success) return JSON.stringify({ error: 'issueRelationCreate failed' })
         return JSON.stringify({ ok: true, relationId: data.issueRelationCreate.relation.id }, null, 2)
       },
@@ -1004,7 +1078,7 @@ function registerLinearTools(ctx, config) {
         const teamId = await resolveTeamId(key(), args.team)
         const vars = { teamId }
         if (after !== undefined) vars.after = after
-        const varDecl = after !== undefined ? 'query($teamId: String!, $after: String)' : 'query($teamId: String!)'
+        const varDecl = after !== undefined ? 'query($teamId: ID!, $after: String)' : 'query($teamId: ID!)'
         // One shared argument list: the cursor is declared only when it is also
         // passed, so a call with no `after` sends exactly the pre-pagination document.
         const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
@@ -1039,7 +1113,7 @@ function registerLinearTools(ctx, config) {
         const teamId = await resolveTeamId(key(), args.team)
         const vars = { teamId }
         if (after !== undefined) vars.after = after
-        const varDecl = after !== undefined ? 'query($teamId: String!, $after: String)' : 'query($teamId: String!)'
+        const varDecl = after !== undefined ? 'query($teamId: ID!, $after: String)' : 'query($teamId: ID!)'
         // One shared argument list: the cursor is declared only when it is also
         // passed, so a call with no `after` sends exactly the pre-pagination document.
         const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
@@ -1086,7 +1160,7 @@ function registerLinearTools(ctx, config) {
             }
           }
         `, vars)
-        return JSON.stringify({ count: data.projects.nodes.length, projects: data.projects.nodes, pageInfo: normalizePageInfo(data.projects.pageInfo) }, null, 2)
+        return JSON.stringify({ count: data.projects.nodes.length, projects: data.projects.nodes.map(normalizeProjectTeams), pageInfo: normalizePageInfo(data.projects.pageInfo) }, null, 2)
       },
     }),
   )
@@ -1119,7 +1193,7 @@ function registerLinearTools(ctx, config) {
           }
         `, { input })
         if (!data.projectCreate.success) return JSON.stringify({ error: 'projectCreate failed' })
-        return JSON.stringify(data.projectCreate.project, null, 2)
+        return JSON.stringify(normalizeProjectTeams(data.projectCreate.project), null, 2)
       },
     }),
   )
@@ -1176,7 +1250,7 @@ function registerLinearTools(ctx, config) {
           }
         `, { id: projectId, input })
         if (!data.projectUpdate.success) return JSON.stringify({ error: 'projectUpdate failed' })
-        return JSON.stringify(data.projectUpdate.project, null, 2)
+        return JSON.stringify(normalizeProjectTeams(data.projectUpdate.project), null, 2)
       },
     }),
   )
@@ -1201,7 +1275,7 @@ function registerLinearTools(ctx, config) {
         const data = await gql(key(), `
           mutation($input: IssueLabelCreateInput!) {
             issueLabelCreate(input: $input) {
-              success label { ${LABEL_FIELDS} }
+              success label: issueLabel { ${LABEL_FIELDS} }
             }
           }
         `, {
@@ -1240,7 +1314,7 @@ function registerLinearTools(ctx, config) {
         const teamId = await resolveTeamId(key(), args.team)
         const vars = { teamId }
         if (after !== undefined) vars.after = after
-        const varDecl = after !== undefined ? 'query($teamId: String!, $after: String)' : 'query($teamId: String!)'
+        const varDecl = after !== undefined ? 'query($teamId: ID!, $after: String)' : 'query($teamId: ID!)'
         // One shared argument list: the cursor is declared only when it is also
         // passed, so a call with no `after` sends exactly the pre-pagination document.
         const argList = [after !== undefined ? 'after: $after' : null].filter(Boolean).join(', ')
@@ -1385,7 +1459,7 @@ function registerLinearTools(ctx, config) {
           }
         `, { id: args.id })
         if (!data.project) return JSON.stringify({ error: `Project not found: ${args.id}` })
-        return JSON.stringify(data.project, null, 2)
+        return JSON.stringify(normalizeProjectTeams(data.project), null, 2)
       },
     }),
   )

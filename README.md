@@ -23,10 +23,13 @@ entire surface; nothing else is registered under any condition.
 > bounded by Linear's own API and by your key's permissions, so it extends
 > coverage, it does not guarantee parity. See [Limitations](#limitations).
 
-> Status: this is **version 0.2.2** of the standalone implementation — the
+> Status: this is **version 0.2.3** of the standalone implementation — the
 > GitHub release for it is
-> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2),
-> and the package is published on npm as `@kb1slnlabs/dsh-linear`. The earlier
+> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3),
+> and the package is published on npm as `@kb1slnlabs/dsh-linear`. **0.2.3** is a
+> patch over **0.2.2**: it corrects the GraphQL documents behind project output,
+> state/label listing, issue updates, relation creation, and label creation (see
+> [Live verification of 0.2.3](#live-verification-of-023)). The earlier
 > **0.1.0** release, also on the public GitHub repository `KB1SLN-Labs/dsh-linear`
 > and on npm, shipped with an MCP bridge to Linear's hosted MCP server; that
 > bridge is gone from 0.2.x (see **There is no MCP in this package — at all.**
@@ -52,7 +55,7 @@ entire surface; nothing else is registered under any condition.
 | `linear_comment_update` | Update a comment body (comment UUID from `linear_comment_list`) |
 | `linear_comment_delete` | Delete a comment (comment UUID) — destructive |
 | `linear_comment_list` | List comments on an issue (newest first; cursor pagination via `after` / `pageInfo`) |
-| `linear_relation_add` | Link a related issue (`related` / `blockedBy` / `blocks` / `parent` / `child`) |
+| `linear_relation_add` | Link a related issue (`related` / `blockedBy` / `blocks` / `parent` / `child`, also `duplicate` / `similar`) — see [How relations are created](#how-relations-are-created) |
 | `linear_team_list` | List teams (`after` / `pageInfo`; page size fixed at 100, no `limit` argument) |
 | `linear_team_get` | One team by id (UUID) or key |
 | `linear_state_list` | List workflow states for a team (cursor pagination via `after` / `pageInfo`) |
@@ -214,7 +217,7 @@ other. The commands further down this section target the **web profile**.
    do not rely on a `dsh` on your PATH, which may belong to a different install):
 
    ```powershell
-   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.2
+   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.3
    ```
 
 3. **Reopen DSH Desktop and start a new conversation.** A session that was already
@@ -235,12 +238,13 @@ other. The commands further down this section target the **web profile**.
    Replace `<issue-id>` with an issue you can see, e.g. `TEAM-123`. A correct answer
    means the plugin loaded **and** the key resolved.
 
-0.2.2 needs a **full DSH host that satisfies the peer range below** — it will not
+0.2.3 needs a **full DSH host that satisfies the peer range below** — it will not
 load into a bare base-only profile (see
 [Dependencies provided by the host](#dependencies-provided-by-the-host)). The
-Desktop runtime it has actually been tested against is **0.2.1-rc.3**; other
-platforms and runtimes are untested, and no real write to Linear has been
-verified end-to-end (see
+Desktop runtime it has actually been loaded against is **0.2.1-rc.3**; other
+platforms and runtimes are untested, and **the 0.2.3 fixes have not yet been
+exercised in a real DSH Desktop conversation** (see
+[Live verification of 0.2.3](#live-verification-of-023) and
 [What is verified vs. what is not](#what-is-verified-vs-what-is-not)).
 
 **If something goes wrong:**
@@ -252,13 +256,13 @@ verified end-to-end (see
   [Configuration](#configuration) table is yielding a key; check all three, and
   remember that a variable set after Desktop started may never reach it.
 - **PTC prepare error — `Cannot read properties of undefined (reading 'prepare')`
-  — on 0.2.1** → install the 0.2.2 package as above (it removes the duplicate
+  — on 0.2.1** → install the 0.2.3 package as above (it removes the duplicate
   `@deepseek-ai/dsh-tools` copy that causes this) and restart Desktop.
 
 ### The four install routes below are web-profile alternatives
 
-This is **version 0.2.2** of the standalone implementation; its release is
-[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.2),
+This is **version 0.2.3** of the standalone implementation; its release is
+[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3),
 and the tarball attached to that release — `kb1slnlabs-dsh-linear.tgz` — is the
 pinned artifact for route 4 below. Four install routes:
 
@@ -275,9 +279,9 @@ dsh plugin --profile web add github:KB1SLN-Labs/dsh-linear
 # 3. from npm, by package name (latest published version)
 dsh plugin --profile web add @kb1slnlabs/dsh-linear
 
-# 4. version-pinned release asset — download the tarball attached to the v0.2.2
+# 4. version-pinned release asset — download the tarball attached to the v0.2.3
 #    GitHub release, then install it from disk:
-#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.2/kb1slnlabs-dsh-linear.tgz
+#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.3/kb1slnlabs-dsh-linear.tgz
 dsh plugin --profile web add file:./kb1slnlabs-dsh-linear.tgz
 ```
 
@@ -291,10 +295,10 @@ picks up edits in place. Use an **absolute** path — that is what this repo's o
 used, and it is what makes the spec unambiguous regardless of where `dsh plugin` runs
 from. Routes 2–4 install a copy instead, so later source edits do not leak into the
 profile. Only route 4 pins an exact version: `kb1slnlabs-dsh-linear.tgz` is the fixed
-release-asset name for the v0.2.2 GitHub release — renamed from the output of
+release-asset name for the v0.2.3 GitHub release — renamed from the output of
 `npm pack`, not the filename npm itself generates. Route 2 follows the repository's
 default branch and route 3 follows npm's `latest`, so neither is guaranteed to install
-0.2.2 once newer work or releases exist; use route 4 when reproducibility matters.
+0.2.3 once newer work or releases exist; use route 4 when reproducibility matters.
 
 The clean scratch profile behind the verification described under
 [Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
@@ -436,6 +440,28 @@ services inside a bare `Context`. And it never contacts Linear: no GraphQL call 
 The scratch profile it runs against is a throwaway directory, not your day-to-day
 profile.
 
+### Live verification of 0.2.3
+
+The 0.2.3 fixes were exercised **directly through the plugin's own harness** — the
+working copy of this repo driven tool-by-tool against **live Linear**, not through a
+DSH conversation and not through `test.js`. That is a different kind of evidence from
+the automated suites above, so it is recorded here as its own line.
+
+- **All 26 named tools were exercised against live Linear** through the working-copy
+  plugin — the 25 hand-modelled tools plus the `linear_graphql` escape hatch.
+- **Write paths exercised on temporary resources created for the run:** issue
+  create / update / cancel / archive / unarchive; comment add / update / delete;
+  label create / get / cleanup; project create / get / update / cleanup; relation
+  `related`, `blocks`, `blockedBy`, `parent` and `child`; and generic GraphQL
+  (both a query and a mutation document).
+- **Cleanup semantics:** the temporary project and the secondary temporary issue
+  were placed in **Trash** — Linear's soft-delete. They were **not** permanently
+  deleted, and this package does not hard-delete either of them.
+- **Not live-tested:** the `duplicate` and `similar` relation variants, and every
+  field/error combination. The live run covered the paths listed above; it is not a
+  combinatorial sweep, so unlisted argument shapes and error branches remain
+  mock-only.
+
 ### What is verified vs. what is not
 
 - **Verified (mock-tested):** what `test.js` asserts — registration of exactly the 26
@@ -474,17 +500,12 @@ profile.
   five direct-write mutations, their arguments, and their payload shapes (`ProjectPayload`,
   `CommentPayload`, `DeletePayload`, `IssueArchivePayload`), exist.
 - **Reported by the user (not an automated test):** in a **new conversation on DSH
-  Desktop 0.2.1-rc.3** using the **local 0.2.2 candidate**, a **read-only `APT-941`
-  lookup succeeded**. That is a human report about one session, deliberately kept apart
+  Desktop 0.2.1-rc.3** using the **local 0.2.2 candidate**, a **read-only lookup of `a test issue`
+  succeeded**. That is a human report about one session, deliberately kept apart
   from the automated suites above: it was not run by `test.js`, `test-loader.mjs`, or any
   script in this repo, and **no live mutations were tested** — nothing wrote to Linear. It
   shows the plugin loaded and answered a read through the real desktop runtime; it does
   not prove the packaging explanation below was the cause of the earlier failure.
-- **Not verified:** no run in this repo's check has exercised a real `linear_*` **write**
-  end-to-end against `api.linear.app` — the GraphQL half is proven against a mock that
-  mirrors the introspected schema (plus the live schema-shape guard above), not against
-  real issue mutations. Nothing here was run on more than one Windows host/runtime, so
-  treat other platforms as untested.
 - **Reproduced mechanism, likely but unproven cause:** the `@deepseek-ai/dsh-tools`
   double-instance explanation in
   [Dependencies provided by the host](#dependencies-provided-by-the-host) — that a
@@ -500,7 +521,13 @@ profile.
   `^0.2.1-rc.3` peer, dev-only lockfile entries, and resolution that prefers the running
   DSH process entry point. The only 0.2.2-candidate session evidence available is the
   user-reported successful read-only lookup above; no automated live run against 0.2.2 has
-  been performed here, and no mutation path has been exercised live.
+  been performed here, and no full DSH Desktop conversation on 0.2.3 has been exercised —
+  the live writes recorded under
+  [Live verification of 0.2.3](#live-verification-of-023) were driven through the plugin's
+  own harness against the 0.2.3 working copy, not through a desktop conversation. Nothing
+  here was run on more than one Windows host/runtime, so treat other platforms as untested;
+  the live run is not a combinatorial sweep, so unlisted argument shapes and error branches
+  remain mock-only.
 
 ## Limitations
 
@@ -578,3 +605,23 @@ Note that the update/archive mutations do **not** put the target's UUID inside `
 argument, and `commentDelete(id:)`, `issueArchive(id:)` and `issueUnarchive(id:)` take a bare
 `id` at all — there is no `CommentDeleteInput` or archive-input type in the Linear schema. The
 archive mutations return their issue under the payload field `entity`, not `issue`.
+
+### How relations are created
+
+`linear_relation_add` keeps its five advertised types (`related`, `blockedBy`, `blocks`,
+`parent`, `child`, plus Linear's own `duplicate` and `similar`), but the live schema backs
+only four relation types — `IssueRelationType` is exactly **`blocks` / `duplicate` /
+`related` / `similar`**. So the extra names are mappings, not enum values:
+
+| `type` | What actually happens on the wire |
+|---|---|
+| `related`, `blocks`, `duplicate`, `similar` | `issueRelationCreate(input:)` with that type, `issueId` = `issue`, `relatedIssueId` = `related` |
+| `blockedBy` | `issueRelationCreate` with type **`blocks`** and the two issues **swapped** — "<related> blocks <issue>" is how Linear represents "issue is blocked by related". There is no `blockedBy` enum member. |
+| `parent` | `issueUpdate(id: <issue>, input: { parentId: <related> })` — parent/child in Linear is the child's `parentId`, not a relation record |
+| `child` | `issueUpdate(id: <related>, input: { parentId: <issue> })` |
+
+The created relation comes back from `IssueRelationPayload.issueRelation` — there is **no**
+`relation` field on that payload, so the document aliases it (`relation: issueRelation { id }`)
+to keep the tool's `{ ok, relationId }` response shape. Because the `parent` and `child`
+routes create no `IssueRelation` record at all, there is no relation id to report: they return
+the explicit `{ ok: true, relationId: null, parentId, childId }` instead of inventing one.
