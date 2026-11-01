@@ -1,5 +1,7 @@
 # @kb1slnlabs/dsh-linear
 
+**Getting started:** [Install in DSH Desktop](#dsh-desktop--easiest).
+
 Linear issue-tracking tools for the DeepSeek Harness. A Cordis function/namespace
 plugin (`export { name, inject, apply }`, no default export) that registers
 model-facing tools through `ctx.tools.register`.
@@ -23,10 +25,12 @@ entire surface; nothing else is registered under any condition.
 > bounded by Linear's own API and by your key's permissions, so it extends
 > coverage, it does not guarantee parity. See [Limitations](#limitations).
 
-> Status: this is **version 0.2.4** of the standalone implementation — the
+> Status: this is **version 0.2.5** of the standalone implementation — the
 > GitHub release for it is
-> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4),
-> and the package is published on npm as `@kb1slnlabs/dsh-linear`. **0.2.4** is a
+> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.5](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.5),
+> and the package is published on npm as `@kb1slnlabs/dsh-linear`. **0.2.5** marks
+> the Cordis peer as host-provided/optional so pnpm no longer emits a misleading
+> missing-peer warning; **0.2.4** introduced the schema conflict fix. **0.2.4** is a
 > patch over **0.2.3**: it updates the schema dependency,
 > `@deepseek-ai/schemastery`, to prevent a conflict with Ponytail. **0.2.3** in turn is
 > a patch over **0.2.2**: it corrects the GraphQL documents behind project output,
@@ -146,13 +150,7 @@ the key-file path, and nothing that changes or widens this order.
 |---|---|---|---|---|
 | GraphQL key | `LINEAR_API_KEY` | `apiKey` | all 26 `linear_*` tools, incl. `linear_graphql` | `Authorization: <raw key>` — **not** `Bearer` |
 
-```powershell
-# PowerShell (current session) — replace the placeholder, do not use a real key here
-$env:LINEAR_API_KEY = "li_api_..."
-
-# or persist for the user
-setx LINEAR_API_KEY "li_api_..."
-```
+Environment variables and plugin config are supported alternatives, and the key file below avoids launcher environment issues.
 
 Or skip the environment entirely and put the key in one of the other two sources.
 The key file has no format beyond the key itself — write it as **the only content
@@ -160,9 +158,13 @@ of the file**, nothing else:
 
 ```powershell
 New-Item -ItemType Directory -Force "$HOME\.config\linear" | Out-Null
-# paste your own key in place of the placeholder, then save the file
-Set-Content -NoNewline -Path "$HOME\.config\linear\api-key" -Value "li_api_..."
+notepad "$HOME\.config\linear\api-key"
 ```
+
+Accept the creation prompt if Notepad offers to create the file, paste **only the
+key** as the file's content, and save. Do not put the key in a terminal command —
+not in `Set-Content`, `setx`, or any other one-liner — because command history or
+logs can retain it.
 
 Any one of the three is enough; you do not need to configure all of them. If you
 set more than one, the table above decides which is used — an `apiKey` config value
@@ -200,9 +202,53 @@ Override env vars used to pin dependency resolution (mainly for offline tests):
 
 ## Install
 
+### DSH Desktop — easiest
+
+1. In DSH Desktop choose **Plugins > Add plugin**, enter
+   `@kb1slnlabs/dsh-linear@0.2.5`, then **install** it and **enable** the plugin.
+2. A Linear personal API key can be supplied by one of the supported methods, and
+   the key-file option is shown below. See [Configuration](#configuration) for
+   the Windows steps and the other supported options. Never paste the key into chat.
+3. **On macOS only** (zsh), create the key file with this subshell script — it will
+   not overwrite an existing key, and a cancelled or empty paste writes nothing:
+
+   ```zsh
+   (
+     umask 077
+     mkdir -p ~/.config/linear
+     if [ -e ~/.config/linear/api-key ]; then
+       print 'A Linear API key file already exists; leaving it unchanged.'
+     elif read -rs "LINEAR_KEY?Paste your Linear API key, then press Enter: " && [ -n "$LINEAR_KEY" ]; then
+       printf %s "$LINEAR_KEY" > ~/.config/linear/api-key
+       chmod 600 ~/.config/linear/api-key
+     else
+       print 'No key entered; no key file was created.'
+     fi
+     unset LINEAR_KEY
+   )
+   ```
+
+   The `read -rs` prompt keeps the key off terminal echo and out of shell history;
+   it is never passed through `echo`.
+
+   On Windows, use the Notepad route instead — there is no `zsh` here, and the key
+   never appears in a terminal command:
+
+   ```powershell
+   New-Item -ItemType Directory -Force "$HOME\.config\linear" | Out-Null
+   notepad "$HOME\.config\linear\api-key"
+   ```
+
+   Accept the creation prompt if Notepad offers to create the file, paste **only the
+   key** as the file's content, and save.
+4. **Fully quit DSH Desktop and reopen it**, then **start a new conversation** and
+   ask: `Use linear_issue_get to read TEAM-123 and report its title and status.`
+
+CLI alternatives are below. **DSH Desktop and web are separate profiles.**
+
 ### Windows quick start (DSH Desktop)
 
-If you use **DSH Desktop**, follow this first. **Desktop and web are separate
+Use these commands if you prefer the terminal on Windows. **Desktop and web are separate
 profiles**: installing the plugin into one does not make it available in the
 other. The commands further down this section target the **web profile**.
 
@@ -219,7 +265,7 @@ other. The commands further down this section target the **web profile**.
    do not rely on a `dsh` on your PATH, which may belong to a different install):
 
    ```powershell
-   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.4
+   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.5
    ```
 
 3. **Reopen DSH Desktop and start a new conversation.** A session that was already
@@ -241,10 +287,11 @@ other. The commands further down this section target the **web profile**.
    means the plugin loaded **and** the key resolved.
 
  **0.2.4** updates the schema dependency, `@deepseek-ai/schemastery`, to prevent a
-conflict with Ponytail — install 0.2.4 rather than an earlier version if that conflict
-is what you are hitting.
+conflict with Ponytail — install 0.2.5 (or at least 0.2.4) rather than an earlier
+version if that conflict is what you are hitting; 0.2.5 adds only the optional-peer
+packaging change on top of it.
 
-0.2.4 requires a full DSH host. Earlier release 0.2.3 was tested in DSH Desktop on Windows; 0.2.4 has been tested with a clean rc.5 profile and mocked Linear calls, but has not yet been verified in macOS Desktop.
+0.2.5 requires a full DSH host. Earlier release 0.2.3 was tested in DSH Desktop on Windows; 0.2.4 has been tested with a clean rc.5 profile and mocked Linear calls, but has not yet been verified in macOS Desktop. 0.2.5 has not been live-tested on macOS either — the packaging change it carries is not a separately verified runtime result.
 
 **If something goes wrong:**
 
@@ -260,8 +307,8 @@ is what you are hitting.
 
 ### The four install routes below are web-profile alternatives
 
-This is **version 0.2.4** of the standalone implementation; its release is
-[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4),
+This is **version 0.2.5** of the standalone implementation; its release is
+[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.5](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.5),
 and the tarball attached to that release — `kb1slnlabs-dsh-linear.tgz` — is the
 pinned artifact for route 4 below. Four install routes:
 
@@ -278,9 +325,9 @@ dsh plugin --profile web add github:KB1SLN-Labs/dsh-linear
 # 3. from npm, by package name (latest published version)
 dsh plugin --profile web add @kb1slnlabs/dsh-linear
 
-# 4. version-pinned release asset — download the tarball attached to the v0.2.4
+# 4. version-pinned release asset — download the tarball attached to the v0.2.5
 #    GitHub release, then install it from disk:
-#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.4/kb1slnlabs-dsh-linear.tgz
+#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.5/kb1slnlabs-dsh-linear.tgz
 dsh plugin --profile web add file:./kb1slnlabs-dsh-linear.tgz
 ```
 
@@ -294,10 +341,10 @@ picks up edits in place. Use an **absolute** path — that is what this repo's o
 used, and it is what makes the spec unambiguous regardless of where `dsh plugin` runs
 from. Routes 2–4 install a copy instead, so later source edits do not leak into the
 profile. Only route 4 pins an exact version: `kb1slnlabs-dsh-linear.tgz` is the fixed
-release-asset name for the v0.2.4 GitHub release — renamed from the output of
+release-asset name for the v0.2.5 GitHub release — renamed from the output of
 `npm pack`, not the filename npm itself generates. Route 2 follows the repository's
 default branch and route 3 follows npm's `latest`, so neither is guaranteed to install
-0.2.4 once newer work or releases exist; use route 4 when reproducibility matters.
+0.2.5 once newer work or releases exist; use route 4 when reproducibility matters.
 
 The clean scratch profile behind the verification described under
 [Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
@@ -313,7 +360,7 @@ that is how the scratch profile used by [Testing](#testing) was built.
 
 Peer dependencies `@deepseek-ai/dsh-tools` and `@deepseek-ai/cordis`, plus the
 `@deepseek-ai/schemastery` this package depends on, normally resolve from the **dsh
-install's own** `node_modules`. Version 0.2.4 updates the exact Schemastery dependency from 3.18.2 to 3.18.5, which provides the volatile schema API used by Ponytail. The plugin resolves each dependency as a bare specifier
+install's own** `node_modules`. Version 0.2.4 updates the exact Schemastery dependency from 3.18.2 to 3.18.5, which provides the volatile schema API used by Ponytail. Version 0.2.5 marks the `@deepseek-ai/cordis` peer as host-provided and optional in `peerDependenciesMeta`, which is what stops pnpm reporting a missing-peer warning for it — the host supplies Cordis; the package never installs its own copy. The plugin resolves each dependency as a bare specifier
 first, then from an anchor derived portably from `process.execPath` (the npm/pnpm global
 prefix), then `%APPDATA%/npm/node_modules` on Windows or `/usr/local/lib/node_modules` /
 `/usr/lib/node_modules` on POSIX.

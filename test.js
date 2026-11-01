@@ -1998,6 +1998,7 @@ const manifest = JSON.parse(readFileSync(join(here, 'package.json'), 'utf8'))
 assert.equal(manifest.dependencies['@deepseek-ai/dsh-tools'], undefined, 'no production dependency on @deepseek-ai/dsh-tools')
 assert.equal(manifest.peerDependencies['@deepseek-ai/dsh-tools'], '^0.2.1-rc.3', 'peer requirement kept as ^0.2.1-rc.3')
 assert.equal(manifest.peerDependenciesMeta['@deepseek-ai/dsh-tools'].optional, true, '@deepseek-ai/dsh-tools peer marked optional')
+assert.equal(manifest.peerDependenciesMeta['@deepseek-ai/cordis'].optional, true, '@deepseek-ai/cordis peer marked optional')
 assert.equal(manifest.devDependencies['@deepseek-ai/dsh-tools'], '0.2.1-rc.3', 'devDependency pinned to 0.2.1-rc.3 for local tests')
 
 // The lockfile must agree with the manifest, and must not carry dsh-tools as a
