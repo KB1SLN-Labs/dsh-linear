@@ -205,7 +205,8 @@ Override env vars used to pin dependency resolution (mainly for offline tests):
 ### DSH Desktop — easiest
 
 1. In DSH Desktop choose **Plugins > Add plugin**, enter
-   `@kb1slnlabs/dsh-linear@0.2.5`, then **install** it and **enable** the plugin.
+   `@kb1slnlabs/dsh-linear`, then **install** it and **enable** the plugin.
+   If npm has not yet published the latest GitHub release, the Add plugin dialog can instead install the version-pinned release tarball URL shown below.
 2. A Linear personal API key can be supplied by one of the supported methods, and
    the key-file option is shown below. See [Configuration](#configuration) for
    the Windows steps and the other supported options. Never paste the key into chat.
@@ -265,7 +266,7 @@ other. The commands further down this section target the **web profile**.
    do not rely on a `dsh` on your PATH, which may belong to a different install):
 
    ```powershell
-   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.5
+   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear
    ```
 
 3. **Reopen DSH Desktop and start a new conversation.** A session that was already
