@@ -23,6 +23,11 @@ const here = dirname(fileURLToPath(import.meta.url))
 // ~/.config/linear/api-key — its contents are never read by this suite.
 const realHomeDir = homedir()
 
+// Ponytail requires the volatile schema API from the resolved Schemastery package.
+const sm = await import('@deepseek-ai/schemastery')
+const zsm = typeof sm.default?.object === 'function' ? sm.default : sm
+assert.equal(typeof zsm.boolean().volatile, 'function', '@deepseek-ai/schemastery schemas keep .volatile() — Ponytail compatibility: the plugin Config is declared through the host-resolved schemastery, and a copy without volatile() breaks config parsing at load')
+
 // Capture the real key BEFORE the test overwrites LINEAR_API_KEY with a fake
 // value below (line ~36) and deletes it at the end. The introspection guard
 // (section 5) needs the real key to hit the live Linear schema.

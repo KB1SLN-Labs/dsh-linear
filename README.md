@@ -23,11 +23,13 @@ entire surface; nothing else is registered under any condition.
 > bounded by Linear's own API and by your key's permissions, so it extends
 > coverage, it does not guarantee parity. See [Limitations](#limitations).
 
-> Status: this is **version 0.2.3** of the standalone implementation — the
+> Status: this is **version 0.2.4** of the standalone implementation — the
 > GitHub release for it is
-> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3),
-> and the package is published on npm as `@kb1slnlabs/dsh-linear`. **0.2.3** is a
-> patch over **0.2.2**: it corrects the GraphQL documents behind project output,
+> [KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4),
+> and the package is published on npm as `@kb1slnlabs/dsh-linear`. **0.2.4** is a
+> patch over **0.2.3**: it updates the schema dependency,
+> `@deepseek-ai/schemastery`, to prevent a conflict with Ponytail. **0.2.3** in turn is
+> a patch over **0.2.2**: it corrects the GraphQL documents behind project output,
 > state/label listing, issue updates, relation creation, and label creation (see
 > [Live verification of 0.2.3](#live-verification-of-023)). The earlier
 > **0.1.0** release, also on the public GitHub repository `KB1SLN-Labs/dsh-linear`
@@ -217,7 +219,7 @@ other. The commands further down this section target the **web profile**.
    do not rely on a `dsh` on your PATH, which may belong to a different install):
 
    ```powershell
-   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.3
+   & "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add @kb1slnlabs/dsh-linear@0.2.4
    ```
 
 3. **Reopen DSH Desktop and start a new conversation.** A session that was already
@@ -238,14 +240,11 @@ other. The commands further down this section target the **web profile**.
    Replace `<issue-id>` with an issue you can see, e.g. `TEAM-123`. A correct answer
    means the plugin loaded **and** the key resolved.
 
-0.2.3 needs a **full DSH host that satisfies the peer range below** — it will not
-load into a bare base-only profile (see
-[Dependencies provided by the host](#dependencies-provided-by-the-host)). The
-Desktop runtime it has actually been loaded against is **0.2.1-rc.3**; other
-platforms and runtimes are untested, and **the 0.2.3 fixes have not yet been
-exercised in a real DSH Desktop conversation** (see
-[Live verification of 0.2.3](#live-verification-of-023) and
-[What is verified vs. what is not](#what-is-verified-vs-what-is-not)).
+ **0.2.4** updates the schema dependency, `@deepseek-ai/schemastery`, to prevent a
+conflict with Ponytail — install 0.2.4 rather than an earlier version if that conflict
+is what you are hitting.
+
+0.2.4 requires a full DSH host. Earlier release 0.2.3 was tested in DSH Desktop on Windows; 0.2.4 has been tested with a clean rc.5 profile and mocked Linear calls, but has not yet been verified in macOS Desktop.
 
 **If something goes wrong:**
 
@@ -256,13 +255,13 @@ exercised in a real DSH Desktop conversation** (see
   [Configuration](#configuration) table is yielding a key; check all three, and
   remember that a variable set after Desktop started may never reach it.
 - **PTC prepare error — `Cannot read properties of undefined (reading 'prepare')`
-  — on 0.2.1** → install the 0.2.3 package as above (it removes the duplicate
+  — on 0.2.1** → install the 0.2.4 package as above (it removes the duplicate
   `@deepseek-ai/dsh-tools` copy that causes this) and restart Desktop.
 
 ### The four install routes below are web-profile alternatives
 
-This is **version 0.2.3** of the standalone implementation; its release is
-[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.3),
+This is **version 0.2.4** of the standalone implementation; its release is
+[KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4](https://github.com/KB1SLN-Labs/dsh-linear/releases/tag/v0.2.4),
 and the tarball attached to that release — `kb1slnlabs-dsh-linear.tgz` — is the
 pinned artifact for route 4 below. Four install routes:
 
@@ -279,9 +278,9 @@ dsh plugin --profile web add github:KB1SLN-Labs/dsh-linear
 # 3. from npm, by package name (latest published version)
 dsh plugin --profile web add @kb1slnlabs/dsh-linear
 
-# 4. version-pinned release asset — download the tarball attached to the v0.2.3
+# 4. version-pinned release asset — download the tarball attached to the v0.2.4
 #    GitHub release, then install it from disk:
-#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.3/kb1slnlabs-dsh-linear.tgz
+#    https://github.com/KB1SLN-Labs/dsh-linear/releases/download/v0.2.4/kb1slnlabs-dsh-linear.tgz
 dsh plugin --profile web add file:./kb1slnlabs-dsh-linear.tgz
 ```
 
@@ -295,10 +294,10 @@ picks up edits in place. Use an **absolute** path — that is what this repo's o
 used, and it is what makes the spec unambiguous regardless of where `dsh plugin` runs
 from. Routes 2–4 install a copy instead, so later source edits do not leak into the
 profile. Only route 4 pins an exact version: `kb1slnlabs-dsh-linear.tgz` is the fixed
-release-asset name for the v0.2.3 GitHub release — renamed from the output of
+release-asset name for the v0.2.4 GitHub release — renamed from the output of
 `npm pack`, not the filename npm itself generates. Route 2 follows the repository's
 default branch and route 3 follows npm's `latest`, so neither is guaranteed to install
-0.2.3 once newer work or releases exist; use route 4 when reproducibility matters.
+0.2.4 once newer work or releases exist; use route 4 when reproducibility matters.
 
 The clean scratch profile behind the verification described under
 [Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
@@ -314,7 +313,7 @@ that is how the scratch profile used by [Testing](#testing) was built.
 
 Peer dependencies `@deepseek-ai/dsh-tools` and `@deepseek-ai/cordis`, plus the
 `@deepseek-ai/schemastery` this package depends on, normally resolve from the **dsh
-install's own** `node_modules`. The plugin resolves each dependency as a bare specifier
+install's own** `node_modules`. Version 0.2.4 updates the exact Schemastery dependency from 3.18.2 to 3.18.5, which provides the volatile schema API used by Ponytail. The plugin resolves each dependency as a bare specifier
 first, then from an anchor derived portably from `process.execPath` (the npm/pnpm global
 prefix), then `%APPDATA%/npm/node_modules` on Windows or `/usr/local/lib/node_modules` /
 `/usr/lib/node_modules` on POSIX.
