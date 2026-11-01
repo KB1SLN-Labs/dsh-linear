@@ -1,0 +1,42 @@
+name: dsh-compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * *'
+
+jobs:
+  dsh-compatibility:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        dsh-version: ['0.2.1-rc.3', latest, alpha]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install repository dependencies
+        shell: bash
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Install host DSH at the matrix version
+        shell: bash
+        run: npm install --prefix "$RUNNER_TEMP/dsh-host" --ignore-scripts --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh-version }}"
+
+      - name: Point DSH_LINEAR_TOOLS and DSH_LINEAR_SCHEMA at the host install
+        shell: bash
+        run: |
+          node -e 'const path=require("path");const{pathToFileURL}=require("url");const host=path.join(process.env.RUNNER_TEMP,"dsh-host","node_modules","@deepseek-ai","dsh-tools","lib","index.js");const sm=path.join(process.env.RUNNER_TEMP,"dsh-host","node_modules","@deepseek-ai","schemastery","lib","index.mjs");require("fs").appendFileSync(process.env.GITHUB_ENV,`DSH_LINEAR_TOOLS=${pathToFileURL(host).href}\nDSH_LINEAR_SCHEMA=${pathToFileURL(sm).href}\n`)'
+
+      - name: npm test
+        shell: bash
+        env:
+          LINEAR_API_KEY: ''
+        run: npm test
