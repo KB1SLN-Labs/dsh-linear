@@ -324,8 +324,9 @@ dsh plugin --profile web add link:<absolute-path-to-this-directory>
 # 2. from the public GitHub repository (default branch — unpinned)
 dsh plugin --profile web add github:KB1SLN-Labs/dsh-linear
 
-# 3. from npm, by package name (latest published version)
-dsh plugin --profile web add @kb1slnlabs/dsh-linear
+# 3. from npm, pinned to npm version 0.2.4. 0.2.4 can show a missing Cordis peer
+#    warning because DSH supplies Cordis; the 0.2.5 release tarball below avoids it.
+dsh plugin --profile web add @kb1slnlabs/dsh-linear@0.2.4
 
 # 4. version-pinned release asset — download the tarball attached to the v0.2.5
 #    GitHub release, then install it from disk:
@@ -342,11 +343,11 @@ Route 1 (`link:`) points pnpm at the directory rather than copying it, so the pr
 picks up edits in place. Use an **absolute** path — that is what this repo's own install
 used, and it is what makes the spec unambiguous regardless of where `dsh plugin` runs
 from. Routes 2–4 install a copy instead, so later source edits do not leak into the
-profile. Only route 4 pins an exact version: `kb1slnlabs-dsh-linear.tgz` is the fixed
-release-asset name for the v0.2.5 GitHub release — renamed from the output of
+profile. Route 3 pins npm version 0.2.4 and route 4 pins 0.2.5: `kb1slnlabs-dsh-linear.tgz`
+is the fixed release-asset name for the v0.2.5 GitHub release — renamed from the output of
 `npm pack`, not the filename npm itself generates. Route 2 follows the repository's
-default branch and route 3 follows npm's `latest`, so neither is guaranteed to install
-0.2.5 once newer work or releases exist; use route 4 when reproducibility matters.
+default branch, so it is not guaranteed to install 0.2.5 once newer work exists; use
+route 4 when reproducibility matters.
 
 The clean scratch profile behind the verification described under
 [Testing](#testing) was installed through the **DSH plugin manager**, not by hand.
